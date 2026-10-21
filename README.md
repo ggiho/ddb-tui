@@ -41,6 +41,7 @@ or from a checkout: `cargo build --release` and run `target/release/ddb-tui`.
 ddb-tui                                     # AWS profiles from ~/.aws/config and ~/.aws/credentials
 ddb-tui --endpoint http://localhost:8000    # endpoint for the DynamoDB Local entry
 ddb-tui --theme catppuccin-latte            # tokyo-night (default), catppuccin-mocha, catppuccin-latte
+ddb-tui --read-only                         # no writes on any connection
 ```
 
 The connection list shows every profile with its region, account and credential type (read from
@@ -49,6 +50,20 @@ these, and profiles whose name says production are flagged. Profiles are resolve
 AWS SDK, so SSO, assume-role and `credential_process` profiles work; credential environment
 variables are ignored in favor of the selected profile. A profile without a region starts in
 `us-east-1`; press `R` to switch.
+
+Production connections start read-only: editing, deleting, updating and PartiQL writes are
+refused until `W` allows them for the session (after a confirmation); `W` again turns them off.
+A connection counts as production when its profile name says so (`prod`, `prd`, `production`,
+`live` as a word, not `nonprod` or `pre-prod`) or when the settings below list its account or
+profile. SSO errors include the `aws sso login --profile …` command to run.
+
+Settings live in `~/.config/ddb-tui/config` (`$XDG_CONFIG_HOME` when set):
+
+```ini
+production_accounts = 111122223333, 444455556666   # production whatever the profile is called
+production_profiles = legacy-main
+read_only = production                             # production (default), all or none
+```
 
 `T` switches the theme while running and remembers the choice in `~/.config/ddb-tui/theme`
 (`$XDG_CONFIG_HOME` when set). Terminals that do not set `COLORTERM=truecolor` get the nearest
@@ -61,7 +76,7 @@ ones:
 
 | Screen | Keys |
 |---|---|
-| Anywhere | `Ctrl+P` command palette · `T` theme · `?` keys |
+| Anywhere | `Ctrl+P` command palette · `T` theme · `W` allow or block writes · `?` keys |
 | Connections | `/` search profile, region or account · `Enter` connect |
 | Tables | `Enter` open (scan) · `/` search · `t` details · `x` PartiQL · `R` region · `o` saved operations |
 | Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` columns |

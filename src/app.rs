@@ -24,6 +24,7 @@ use crate::item::{self, Item};
 use crate::pager::Pager;
 use crate::profiles::ProfileInfo;
 use crate::saved;
+use crate::settings::{ReadOnly, Settings};
 use crate::theme;
 
 /// Page sizes offered by `+`/`-`; the second is the default.
@@ -139,6 +140,7 @@ const TABLES_KEYS: &[Binding] = &[
     bind("R", "region", KeyCode::Char('R')),
     bind("o", "saved operations", KeyCode::Char('o')),
     bind("r", "refresh tables", KeyCode::Char('r')),
+    bind("W", "allow or block writes", KeyCode::Char('W')),
     bind("T", "switch theme", KeyCode::Char('T')),
     hint("↑↓ / jk", "move"),
     bind("Esc", "connections", KeyCode::Esc),
@@ -172,6 +174,7 @@ const ITEMS_KEYS: &[Binding] = &[
     bind("s", "plain scan", KeyCode::Char('s')),
     bind("x", "PartiQL", KeyCode::Char('x')),
     bind("r", "refresh page", KeyCode::Char('r')),
+    bind("W", "allow or block writes", KeyCode::Char('W')),
     bind("T", "switch theme", KeyCode::Char('T')),
     bind("Esc", "back to tables", KeyCode::Esc),
 ];
@@ -189,6 +192,7 @@ const ITEM_DETAIL_KEYS: &[Binding] = &[
     bind("y", "copy as DynamoDB JSON", KeyCode::Char('y')),
     bind("Y", "copy as plain JSON", KeyCode::Char('Y')),
     hint("↑↓ / jk", "scroll"),
+    bind("W", "allow or block writes", KeyCode::Char('W')),
     bind("T", "switch theme", KeyCode::Char('T')),
     bind("Esc", "back", KeyCode::Esc),
 ];
@@ -272,6 +276,8 @@ pub enum Confirm {
     Update(ddb::UpdateRequest),
     /// A PartiQL statement that changes data.
     Statement(String),
+    /// Lift read-only mode for the rest of the session.
+    AllowWrites,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,6 +312,12 @@ pub struct App {
     /// Search over the connection list; `conn_filtering` while typing it.
     pub conn_filter: String,
     pub conn_filtering: bool,
+    /// From `~/.config/ddb-tui/config`: production accounts and the read-only policy.
+    pub settings: Settings,
+    /// `--read-only`: no write on any connection, and `W` cannot lift it.
+    pub force_read_only: bool,
+    /// Whether the current connection may write; production connections start without.
+    writes_allowed: bool,
     pub region: String,
     pub region_state: ListState,
     pub tables: Vec<String>,
@@ -353,7 +365,7 @@ pub struct App {
     pub busy: u32,
     pub quit: bool,
     client: Option<Client>,
-    connection: Option<Connection>,
+    pub(crate) connection: Option<Connection>,
     partiql_return: Screen,
     detail_return: Screen,
     edit_request: Option<(EditKind, Item)>,
@@ -387,6 +399,9 @@ impl App {
             profile_info: HashMap::new(),
             conn_filter: String::new(),
             conn_filtering: false,
+            settings: Settings::default(),
+            force_read_only: false,
+            writes_allowed: true,
             region: String::new(),
             region_state: ListState::default(),
             tables: Vec::new(),
@@ -741,12 +756,16 @@ impl App {
                     self.table_cache.clear();
                     self.seen_attrs.clear();
                     self.conn_label = conn.label();
+                    self.writes_allowed = !self.starts_read_only(&conn);
                     self.connection = Some(conn);
                     self.region = region;
                     self.set_tables(tables);
                     self.screen = Screen::Tables;
                 }
-                Err(e) => self.error(e),
+                Err(e) => {
+                    let text = login_hint(format!("{e:#}"), Some(&conn));
+                    self.set_status(Status::Error(text));
+                }
             },
             Msg::Tables(result) => match result {
                 Ok(tables) => self.set_tables(tables),
@@ -905,6 +924,13 @@ impl App {
             self.cycle_theme();
             return;
         }
+        if key.code == KeyCode::Char('W')
+            && !typing
+            && matches!(self.screen, Screen::Tables | Screen::Items | Screen::Detail)
+        {
+            self.toggle_writes();
+            return;
+        }
         match self.screen {
             Screen::Connections => self.key_connections(key.code),
             Screen::Tables => self.key_tables(key.code),
@@ -958,6 +984,57 @@ impl App {
         self.open_table(name);
     }
 
+    /// Whether a profile counts as production: by its name, or listed in the settings by
+    /// name or account.
+    pub fn is_production_profile(&self, name: &str) -> bool {
+        is_production(name)
+            || self.settings.production_profiles.iter().any(|p| p == name)
+            || self
+                .profile_info
+                .get(name)
+                .and_then(|i| i.account.as_ref())
+                .is_some_and(|a| self.settings.production_accounts.contains(a))
+    }
+
+    /// Whether the current connection is a production profile.
+    pub fn on_production(&self) -> bool {
+        matches!(&self.connection, Some(Connection::Profile(name)) if self.is_production_profile(name))
+    }
+
+    pub fn read_only(&self) -> bool {
+        !self.writes_allowed
+    }
+
+    fn starts_read_only(&self, conn: &Connection) -> bool {
+        self.force_read_only
+            || match self.settings.read_only {
+                ReadOnly::All => true,
+                ReadOnly::None => false,
+                ReadOnly::Production => {
+                    matches!(conn, Connection::Profile(name) if self.is_production_profile(name))
+                }
+            }
+    }
+
+    fn read_only_reason(&self) -> &'static str {
+        if self.force_read_only {
+            "Read-only (started with --read-only): writes are off"
+        } else {
+            "Read-only on this connection · W allows writes for the session"
+        }
+    }
+
+    fn toggle_writes(&mut self) {
+        if self.force_read_only {
+            self.info(self.read_only_reason());
+        } else if self.writes_allowed {
+            self.writes_allowed = false;
+            self.ok("Read-only again");
+        } else {
+            self.confirm = Some(Confirm::AllowWrites);
+        }
+    }
+
     fn cycle_theme(&mut self) {
         let name = theme::cycle();
         match theme::save() {
@@ -978,6 +1055,10 @@ impl App {
                 Some(Confirm::Delete { table, keys, .. }) => self.delete(table, keys),
                 Some(Confirm::Update(req)) => self.update(req),
                 Some(Confirm::Statement(statement)) => self.run_statement(statement),
+                Some(Confirm::AllowWrites) => {
+                    self.writes_allowed = true;
+                    self.ok("Writes allowed for this session · W turns them off");
+                }
                 None => {}
             },
             KeyCode::Char('n') | KeyCode::Esc => {
@@ -1411,6 +1492,8 @@ impl App {
                 if statement.is_empty() {
                 } else if ddb::is_select(&statement) {
                     self.run_statement(statement);
+                } else if self.read_only() {
+                    self.info(self.read_only_reason());
                 } else {
                     // Writes ask first, like every other write.
                     self.confirm = Some(Confirm::Statement(statement));
@@ -1726,6 +1809,10 @@ impl App {
 
     /// The table and its client when the current read can be written back; otherwise says why.
     fn writable(&mut self) -> Option<(String, TableInfo, Client)> {
+        if self.read_only() {
+            self.info(self.read_only_reason());
+            return None;
+        }
         let Some(table) = self.request_table() else {
             self.info("Writes work on Scan/Query results; PartiQL results have no table");
             return None;
@@ -2131,12 +2218,29 @@ impl App {
     }
 
     fn error(&mut self, e: impl std::fmt::Display) {
-        self.set_status(Status::Error(format!("{e:#}")));
+        let text = login_hint(format!("{e:#}"), self.connection.as_ref());
+        self.set_status(Status::Error(text));
     }
 
     fn set_status(&mut self, status: Status) {
         self.status = status;
         self.status_at = Instant::now();
+    }
+}
+
+/// Adds the login command to SSO errors, which otherwise only say that the token expired or
+/// could not be loaded.
+fn login_hint(text: String, conn: Option<&Connection>) -> String {
+    let lower = text.to_lowercase();
+    let sso = lower.contains("sso token")
+        || lower.contains("sso session")
+        || lower.contains("sso/cache")
+        || (lower.contains("unauthorized") && lower.contains("session token"));
+    match conn {
+        Some(Connection::Profile(name)) if sso => {
+            format!("{text} · run: aws sso login --profile {name}")
+        }
+        _ => text,
     }
 }
 
@@ -2636,6 +2740,70 @@ mod tests {
             app.form.active(app.table.as_ref().unwrap()),
             Field::Projection,
             "nothing left to complete"
+        );
+    }
+
+    #[test]
+    fn production_connections_start_read_only_until_w() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut row = item(&[("pk", "a")]);
+        row.insert("sk".into(), AttributeValue::N("1".into()));
+        let mut app = table_app(&rt, vec![row]);
+        app.connection = Some(Connection::Profile("core".into()));
+        app.profile_info.insert(
+            "core".into(),
+            ProfileInfo {
+                account: Some("111122223333".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!app.on_production(), "the name says nothing");
+        app.settings.production_accounts = vec!["111122223333".into()];
+        assert!(app.on_production(), "the account is listed");
+        app.writes_allowed = !app.starts_read_only(&Connection::Profile("core".into()));
+
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.confirm.is_none(), "no delete while read-only");
+        assert!(matches!(&app.status, Status::Info(s) if s.starts_with("Read-only")));
+
+        press(&mut app, KeyCode::Char('W'));
+        assert!(matches!(app.confirm, Some(Confirm::AllowWrites)));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(
+            matches!(app.confirm, Some(Confirm::Delete { .. })),
+            "writes allowed"
+        );
+        app.confirm = None;
+
+        press(&mut app, KeyCode::Char('W'));
+        assert!(app.read_only(), "W locks again without asking");
+        app.force_read_only = true;
+        press(&mut app, KeyCode::Char('W'));
+        assert!(
+            app.confirm.is_none() && app.read_only(),
+            "--read-only cannot be lifted"
+        );
+    }
+
+    #[test]
+    fn sso_errors_say_how_to_log_in() {
+        let profile = Connection::Profile("acme".into());
+        let text = login_hint(
+            "dispatch failure: the SSO token has expired and cannot be refreshed".into(),
+            Some(&profile),
+        );
+        assert!(
+            text.ends_with("run: aws sso login --profile acme"),
+            "{text}"
+        );
+        assert_eq!(
+            login_hint("AccessDenied".into(), Some(&profile)),
+            "AccessDenied"
+        );
+        assert_eq!(
+            login_hint("the SSO token has expired".into(), None),
+            "the SSO token has expired"
         );
     }
 

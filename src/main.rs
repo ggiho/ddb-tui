@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ddb_tui::app::{App, Msg};
 use ddb_tui::ddb::Connection;
 use ddb_tui::item::{self, Item};
-use ddb_tui::{profiles, theme, ui};
+use ddb_tui::{profiles, settings, theme, ui};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
@@ -20,7 +20,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 const DEFAULT_LOCAL_ENDPOINT: &str = "http://localhost:8000";
 
 fn main() -> Result<()> {
-    let endpoint = parse_args()?;
+    let (endpoint, read_only) = parse_args()?;
     let rt = tokio::runtime::Runtime::new()?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut connections: Vec<Connection> = profiles::profile_names()
@@ -30,6 +30,8 @@ fn main() -> Result<()> {
     connections.push(Connection::Local(endpoint));
     let mut app = App::new(connections, rt.handle().clone(), tx);
     app.profile_info = profiles::profile_info();
+    app.settings = settings::load();
+    app.force_read_only = read_only;
 
     let mut terminal = ratatui::init();
     // Pastes arrive as one event, so a newline in pasted text cannot press Enter.
@@ -41,13 +43,15 @@ fn main() -> Result<()> {
 }
 
 /// Reads the arguments and selects the theme: `--theme`, else the one chosen last time.
-fn parse_args() -> Result<String> {
+fn parse_args() -> Result<(String, bool)> {
     let mut args = std::env::args().skip(1);
     let mut endpoint = DEFAULT_LOCAL_ENDPOINT.to_string();
+    let mut read_only = false;
     theme::load_saved();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--endpoint" => endpoint = args.next().context("--endpoint needs a URL")?,
+            "--read-only" => read_only = true,
             "--theme" => {
                 let name = args.next().context("--theme needs a name")?;
                 ensure!(
@@ -58,7 +62,7 @@ fn parse_args() -> Result<String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: ddb-tui [--endpoint URL] [--theme NAME]\n\n  --endpoint URL  DynamoDB Local endpoint (default {DEFAULT_LOCAL_ENDPOINT})\n  --theme NAME    {} (T switches while running)",
+                    "usage: ddb-tui [--endpoint URL] [--theme NAME] [--read-only]\n\n  --endpoint URL  DynamoDB Local endpoint (default {DEFAULT_LOCAL_ENDPOINT})\n  --theme NAME    {} (T switches while running)\n  --read-only     no writes on any connection; W cannot allow them",
                     theme::NAMES.join(", ")
                 );
                 std::process::exit(0);
@@ -66,7 +70,7 @@ fn parse_args() -> Result<String> {
             other => bail!("unknown argument: {other} (see --help)"),
         }
     }
-    Ok(endpoint)
+    Ok((endpoint, read_only))
 }
 
 fn run(

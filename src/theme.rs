@@ -83,13 +83,9 @@ pub fn cycle() -> &'static str {
     NAMES[next]
 }
 
-/// `$XDG_CONFIG_HOME/ddb-tui/theme`, or `~/.config/ddb-tui/theme`.
+/// `theme` in the settings directory.
 fn saved_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("ddb-tui").join("theme"))
+    Some(crate::settings::config_dir()?.join("theme"))
 }
 
 /// Selects the theme chosen last time, if any.

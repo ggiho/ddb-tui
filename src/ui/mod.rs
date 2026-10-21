@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{self, App, Screen, Status};
+use crate::app::{App, Screen, Status};
 use crate::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -82,9 +82,19 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" ddb-tui ", theme::pill(t.on_accent, t.accent)),
     ];
     let connected = app.screen != Screen::Connections && !app.conn_label.is_empty();
-    if connected && app::is_production(&app.conn_label) {
+    if connected && app.on_production() {
         left.push(Span::raw(" "));
         left.push(theme::production(" ● PROD "));
+    }
+    if connected && app.read_only() {
+        left.push(Span::raw(" "));
+        left.push(Span::styled(
+            " read-only ",
+            Style::new().fg(t.subtext).bg(t.raised),
+        ));
+    } else if connected && app.on_production() {
+        left.push(Span::raw(" "));
+        left.push(theme::production(" writes on "));
     }
     let right = if app.busy > 0 {
         vec![Span::styled(
@@ -573,6 +583,7 @@ mod tests {
                 .contains("PROD")
         );
         app.conn_label = "acme-apac-prod".into();
+        app.connection = Some(Connection::Profile("acme-apac-prod".into()));
         assert!(
             render(&mut app, 120, 20)
                 .lines()

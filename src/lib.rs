@@ -10,5 +10,6 @@ pub mod item;
 pub mod pager;
 pub mod profiles;
 pub mod saved;
+pub mod settings;
 pub mod theme;
 pub mod ui;

@@ -12,7 +12,7 @@ use super::{
     cells, details, draw_centered, draw_input, fit, key_hints, label, pane, popup_open, spinner,
     truncate, width_of,
 };
-use crate::app::{self, App, DetailKind, Screen};
+use crate::app::{App, DetailKind, Screen};
 use crate::ddb::{Connection, ReadRequest};
 use crate::{highlight, theme};
 
@@ -117,7 +117,7 @@ pub(super) fn draw_launcher(f: &mut Frame, app: &mut App, area: Rect) {
     let any_prod = app
         .connections
         .iter()
-        .any(|c| matches!(c, Connection::Profile(n) if app::is_production(n)));
+        .any(|c| matches!(c, Connection::Profile(n) if app.is_production_profile(n)));
     let badge_slot = if any_prod {
         " ● prod ".width() + 2
     } else {
@@ -166,7 +166,7 @@ pub(super) fn draw_launcher(f: &mut Frame, app: &mut App, area: Rect) {
                     let room = name_w.saturating_sub(badge_slot);
                     let shown = pad_to(name, room);
                     spans.extend(highlight::find_spans(&shown, &find, theme::fg(t.text)));
-                    if app::is_production(name) {
+                    if app.is_production_profile(name) {
                         spans.push(Span::raw("  "));
                         spans.push(theme::production(" ● prod "));
                     } else {
@@ -239,7 +239,7 @@ pub(super) fn draw_launcher(f: &mut Frame, app: &mut App, area: Rect) {
 
     let selected_prod = matches!(
         app.selected_connection(),
-        Some(Connection::Profile(name)) if app::is_production(name)
+        Some(Connection::Profile(name)) if app.is_production_profile(name)
     );
     if selected_prod {
         f.render_widget(

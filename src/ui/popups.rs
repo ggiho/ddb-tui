@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, 
 use unicode_width::UnicodeWidthStr;
 
 use super::{centered, clear_popup, fit};
-use crate::app::{self, App, Confirm};
+use crate::app::{App, Confirm};
 use crate::ddb::{self, SkOp};
 use crate::form::Field;
 use crate::{highlight, item, theme};
@@ -585,6 +585,18 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
             }
             ("Delete", true, lines)
         }
+        Some(Confirm::AllowWrites) => (
+            "Allow writes",
+            true,
+            vec![
+                Line::styled(
+                    format!(" Allow writes to {} for this session?", app.conn_label),
+                    bold,
+                ),
+                hint("Edits, deletes, updates and PartiQL writes become possible."),
+                hint("Each still asks first, and W turns writes off again."),
+            ],
+        ),
         Some(Confirm::Statement(statement)) => {
             let width = (area.width as usize).saturating_sub(10).min(76);
             let mut lines = vec![
@@ -618,7 +630,7 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
         None => return,
     };
     lines.insert(0, Line::raw(""));
-    if app::is_production(&app.conn_label) {
+    if app.on_production() {
         lines.insert(
             0,
             Line::from(vec![
