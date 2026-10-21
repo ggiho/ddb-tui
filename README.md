@@ -86,8 +86,10 @@ Strings are quoted, numbers are bare, `true`, `false` and `null` are literals, l
 
 ## Safety
 
-- Every write asks for confirmation. Creating or duplicating an item, or editing its key, uses a
-  condition so it never replaces an existing item.
+- Every write asks for confirmation, PartiQL `INSERT`/`UPDATE`/`DELETE` included; refreshing a
+  write statement's result never runs it again, and saved write statements open in the editor
+  instead of running. Creating or duplicating an item, or editing its key, uses a condition so
+  it never replaces an existing item.
 - Editing first re-reads the complete item, so rows from a projection or a partially projected
   index cannot drop attributes.
 - Credential files are only read, never written. There is no telemetry.

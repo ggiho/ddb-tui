@@ -342,6 +342,19 @@ impl ReadRequest {
             Self::PartiQL { .. } => None,
         }
     }
+
+    /// A PartiQL statement that changes data: anything but SELECT.
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::PartiQL { statement } if !is_select(statement))
+    }
+}
+
+/// Whether a PartiQL statement only reads. Everything else is treated as a write.
+pub fn is_select(statement: &str) -> bool {
+    statement
+        .trim_start()
+        .get(..6)
+        .is_some_and(|s| s.eq_ignore_ascii_case("select"))
 }
 
 fn non_empty<K, V>(map: HashMap<K, V>) -> Option<HashMap<K, V>> {
@@ -558,11 +571,7 @@ async fn fetch_once(
                 _ => None,
             };
             // Limit only applies to SELECT; writes run once and return no items.
-            let is_select = statement
-                .trim_start()
-                .get(..6)
-                .is_some_and(|s| s.eq_ignore_ascii_case("select"));
-            let limit = is_select.then_some(limit);
+            let limit = is_select(statement).then_some(limit);
             let out = client
                 .execute_statement()
                 .statement(statement)

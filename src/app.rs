@@ -270,6 +270,8 @@ pub enum Confirm {
         hidden: usize,
     },
     Update(ddb::UpdateRequest),
+    /// A PartiQL statement that changes data.
+    Statement(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -975,6 +977,7 @@ impl App {
                 }) => self.save(table, item, create),
                 Some(Confirm::Delete { table, keys, .. }) => self.delete(table, keys),
                 Some(Confirm::Update(req)) => self.update(req),
+                Some(Confirm::Statement(statement)) => self.run_statement(statement),
                 None => {}
             },
             KeyCode::Char('n') | KeyCode::Esc => {
@@ -1405,10 +1408,12 @@ impl App {
             KeyCode::Esc => self.screen = self.partiql_return,
             KeyCode::Enter => {
                 let statement = self.partiql.trim().to_string();
-                if !statement.is_empty() {
-                    self.partiql_return = Screen::Tables;
-                    self.start_read(ReadRequest::PartiQL { statement });
-                    self.screen = Screen::Items;
+                if statement.is_empty() {
+                } else if ddb::is_select(&statement) {
+                    self.run_statement(statement);
+                } else {
+                    // Writes ask first, like every other write.
+                    self.confirm = Some(Confirm::Statement(statement));
                 }
             }
             KeyCode::Char(c) => self.partiql.push(c),
@@ -1563,7 +1568,18 @@ impl App {
         });
     }
 
+    /// Runs a PartiQL statement and shows its result; writes reach here only once confirmed.
+    fn run_statement(&mut self, statement: String) {
+        self.partiql_return = Screen::Tables;
+        self.start_read(ReadRequest::PartiQL { statement });
+        self.screen = Screen::Items;
+    }
+
     fn refresh(&mut self) {
+        if self.request.as_ref().is_some_and(ReadRequest::is_write) {
+            self.info("A write statement is not run again; x opens it to edit and run");
+            return;
+        }
         if self.pager.is_empty() {
             self.fetch(None, false);
         } else {
@@ -1676,7 +1692,7 @@ impl App {
             return;
         }
         self.page_size = PAGE_SIZES[next];
-        if let Some(req) = self.request.clone() {
+        if let Some(req) = self.request.clone().filter(|r| !r.is_write()) {
             self.start_read(req);
         }
         self.info(format!("Page size {}", self.page_size));
@@ -2005,11 +2021,15 @@ impl App {
                 };
                 match saved::load(&entry.path) {
                     Ok(saved::Loaded::Read(read)) => self.apply_saved_read(read),
-                    Ok(saved::Loaded::PartiQL(statement)) => {
+                    Ok(saved::Loaded::PartiQL(statement)) if ddb::is_select(&statement) => {
                         self.partiql = statement.clone();
-                        self.partiql_return = Screen::Tables;
-                        self.start_read(ReadRequest::PartiQL { statement });
-                        self.screen = Screen::Items;
+                        self.run_statement(statement);
+                    }
+                    // A saved write opens in the editor; Enter there asks before running it.
+                    Ok(saved::Loaded::PartiQL(statement)) => {
+                        self.partiql = statement;
+                        self.open_partiql(self.saved_return);
+                        self.info("A saved write statement: Enter asks before it runs");
                     }
                     Ok(saved::Loaded::Unsupported(why)) => self.info(why),
                     Err(e) => self.error(e),
@@ -2505,6 +2525,39 @@ mod tests {
             app.pager.next_cached(),
             "the pages after it are still known"
         );
+    }
+
+    #[test]
+    fn partiql_writes_ask_first_and_never_run_again() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, Vec::new());
+        app.request = None;
+        app.busy = 0;
+        app.screen = Screen::PartiQL;
+        app.partiql = "UPDATE \"t\" SET n = n + 1 WHERE pk = 'a'".into();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.confirm, Some(Confirm::Statement(_))));
+        assert!(app.request.is_none() && app.busy == 0, "nothing ran yet");
+
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.request.as_ref().is_some_and(ReadRequest::is_write));
+        assert_eq!(app.busy, 1, "ran once");
+        for key in ['r', '+', '-'] {
+            press(&mut app, KeyCode::Char(key));
+        }
+        assert_eq!(app.busy, 1, "refresh and page size never run it again");
+    }
+
+    #[test]
+    fn partiql_selects_run_at_once() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, Vec::new());
+        app.busy = 0;
+        app.screen = Screen::PartiQL;
+        app.partiql = "  select * from \"t\"".into();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.busy, 1);
     }
 
     #[test]

@@ -585,6 +585,27 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
             }
             ("Delete", true, lines)
         }
+        Some(Confirm::Statement(statement)) => {
+            let width = (area.width as usize).saturating_sub(10).min(76);
+            let mut lines = vec![
+                Line::styled(" Run this PartiQL statement?", bold),
+                hint("It changes data directly and cannot be undone."),
+                Line::raw(""),
+            ];
+            // The whole statement, wrapped, up to eight lines.
+            let chars: Vec<char> = statement.chars().collect();
+            let chunks: Vec<String> = chars
+                .chunks(width.max(1))
+                .map(|c| c.iter().collect())
+                .collect();
+            for chunk in chunks.iter().take(8) {
+                lines.push(Line::styled(format!("   {chunk}"), theme::fg(t.text)));
+            }
+            if chunks.len() > 8 {
+                lines.push(hint("  …"));
+            }
+            ("Run statement", true, lines)
+        }
         Some(Confirm::Update(req)) => (
             "Update",
             false,
