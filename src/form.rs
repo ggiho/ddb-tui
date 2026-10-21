@@ -1,6 +1,6 @@
 //! The Scan/Query form: key condition, filter, projection and read options.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::ddb::{Index, ReadOptions, ReadRequest, SkCond, SkOp, TableInfo};
 use crate::expr::Placeholders;
@@ -18,6 +18,31 @@ pub enum Field {
     Projection,
     Consistent,
     Order,
+}
+
+/// A form value DynamoDB would reject, tied to its field so the form can show it in place.
+#[derive(Debug)]
+pub struct FieldError {
+    pub field: Field,
+    pub message: String,
+}
+
+impl std::fmt::Display for FieldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FieldError {}
+
+fn at(field: Field) -> impl Fn(anyhow::Error) -> anyhow::Error {
+    move |e| {
+        FieldError {
+            field,
+            message: format!("{e:#}"),
+        }
+        .into()
+    }
 }
 
 /// `op` 0 means no sort key condition, otherwise `SkOp::ALL[op - 1]`.
@@ -137,11 +162,11 @@ impl ReadForm {
         let filter = non_blank(&self.filter)
             .map(|t| ph.condition(t))
             .transpose()
-            .context("Filter")?;
+            .map_err(at(Field::Filter))?;
         let projection = non_blank(&self.projection)
             .map(|t| ph.projection(t))
             .transpose()
-            .context("Projection")?;
+            .map_err(at(Field::Projection))?;
         let opts = ReadOptions {
             filter,
             projection,
@@ -159,12 +184,20 @@ impl ReadForm {
             });
         }
 
-        anyhow::ensure!(!self.pk.is_empty(), "Enter a value for {}", idx.pk.name);
-        let pk = (idx.pk.name.clone(), item::scalar(&idx.pk.ty, &self.pk)?);
+        if self.pk.is_empty() {
+            return Err(at(Field::Pk)(anyhow::anyhow!(
+                "Enter a value for {}",
+                idx.pk.name
+            )));
+        }
+        let pk = (
+            idx.pk.name.clone(),
+            item::scalar(&idx.pk.ty, &self.pk).map_err(at(Field::Pk))?,
+        );
         let sk = match (self.sk_op(), &idx.sk) {
             (Some(op), Some(k)) => {
                 let value2 = if op == SkOp::Between {
-                    Some(item::scalar(&k.ty, &self.sk2)?)
+                    Some(item::scalar(&k.ty, &self.sk2).map_err(at(Field::Sk2))?)
                 } else {
                     None
                 };
@@ -172,7 +205,7 @@ impl ReadForm {
                     k.name.clone(),
                     SkCond {
                         op,
-                        value: item::scalar(&k.ty, &self.sk)?,
+                        value: item::scalar(&k.ty, &self.sk).map_err(at(Field::Sk))?,
                         value2,
                     },
                 ))
@@ -324,8 +357,10 @@ mod tests {
             filter: "a = \"x".into(),
             ..ReadForm::default()
         };
-        let err = format!("{:#}", f.request(&t).unwrap_err());
-        assert!(err.starts_with("Filter: unterminated"), "{err}");
+        let err = f.request(&t).unwrap_err();
+        let fe = err.downcast_ref::<FieldError>().expect("a field error");
+        assert_eq!(fe.field, Field::Filter);
+        assert!(fe.message.starts_with("unterminated"), "{}", fe.message);
     }
 
     #[test]

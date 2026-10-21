@@ -290,6 +290,10 @@ pub struct ReadOptions {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one request is alive at a time, so boxing the Query fields saves nothing"
+)]
 pub enum ReadRequest {
     Scan {
         table: String,

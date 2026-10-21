@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
@@ -19,10 +19,12 @@ use crate::ddb::{self, Connection, Cursor, DeleteReport, Page, ReadRequest, Tabl
 use crate::details;
 use crate::export;
 use crate::expr::Placeholders;
-use crate::form::{Field, ReadForm};
+use crate::form::{Field, FieldError, ReadForm};
 use crate::item::{self, Item};
 use crate::pager::Pager;
+use crate::profiles::ProfileInfo;
 use crate::saved;
+use crate::theme;
 
 /// Page sizes offered by `+`/`-`; the second is the default.
 pub const PAGE_SIZES: [usize; 5] = [25, 50, 100, 200, 500];
@@ -62,10 +64,7 @@ pub enum Msg {
         result: anyhow::Result<Option<f64>>,
     },
     Deleted(DeleteReport),
-    Details {
-        table: String,
-        result: anyhow::Result<String>,
-    },
+    Details(anyhow::Result<details::TableDetails>),
     /// The updated item (ReturnValues ALL_NEW) and the write capacity used.
     Updated(anyhow::Result<(Option<Item>, Option<f64>)>),
     /// The full item fetched for the editor, or `None` if it no longer exists.
@@ -77,7 +76,172 @@ pub enum Msg {
 
 pub enum Status {
     Info(String),
+    /// Work that is under way, such as "Saving…"; shown until the next message.
+    Progress(String),
+    Success(String),
     Error(String),
+}
+
+/// What the detail screen shows, which decides its colors and keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailKind {
+    /// An item, as DynamoDB JSON or plain JSON (`v` switches).
+    Item,
+    /// JSON that is not an item, such as the request log.
+    Json,
+    /// Table details, kept as `App::details`.
+    Table,
+}
+
+/// One key binding: what to press, what it does, and the key the command palette sends
+/// (none for movement and other keys that make no sense as a command).
+pub struct Binding {
+    pub keys: &'static str,
+    pub label: &'static str,
+    pub code: Option<KeyCode>,
+}
+
+const fn bind(keys: &'static str, label: &'static str, code: KeyCode) -> Binding {
+    Binding {
+        keys,
+        label,
+        code: Some(code),
+    }
+}
+
+const fn hint(keys: &'static str, label: &'static str) -> Binding {
+    Binding {
+        keys,
+        label,
+        code: None,
+    }
+}
+
+/// Bindings per screen, most useful first; the footer shows those that fit.
+const CONNECTIONS_KEYS: &[Binding] = &[
+    bind("Enter", "connect", KeyCode::Enter),
+    bind("/", "search profiles", KeyCode::Char('/')),
+    hint("↑↓ / jk", "move"),
+    bind("T", "switch theme", KeyCode::Char('T')),
+    bind("q", "quit", KeyCode::Char('q')),
+];
+const CONNECTIONS_SEARCH_KEYS: &[Binding] = &[
+    hint("type", "search names, regions, accounts"),
+    hint("↑↓", "move"),
+    hint("Enter", "connect"),
+    hint("Esc", "clear"),
+];
+const TABLES_KEYS: &[Binding] = &[
+    bind("/", "search", KeyCode::Char('/')),
+    bind("Enter", "open", KeyCode::Enter),
+    bind("t", "table details", KeyCode::Char('t')),
+    bind("x", "PartiQL", KeyCode::Char('x')),
+    bind("R", "region", KeyCode::Char('R')),
+    bind("o", "saved operations", KeyCode::Char('o')),
+    bind("r", "refresh tables", KeyCode::Char('r')),
+    bind("T", "switch theme", KeyCode::Char('T')),
+    hint("↑↓ / jk", "move"),
+    bind("Esc", "connections", KeyCode::Esc),
+];
+const TABLES_SEARCH_KEYS: &[Binding] = &[
+    hint("type", "search tables"),
+    hint("↑↓", "move"),
+    hint("Enter", "open"),
+    hint("Esc", "clear"),
+];
+const ITEMS_KEYS: &[Binding] = &[
+    bind("/", "search this page", KeyCode::Char('/')),
+    bind("f", "filter / query", KeyCode::Char('f')),
+    bind("Enter", "view item", KeyCode::Enter),
+    bind("e", "edit", KeyCode::Char('e')),
+    bind("u", "update", KeyCode::Char('u')),
+    bind("a", "add item", KeyCode::Char('a')),
+    bind("d", "delete", KeyCode::Char('d')),
+    hint("n / p", "next / previous page"),
+    bind("space", "mark row", KeyCode::Char(' ')),
+    bind("c", "copy as new item", KeyCode::Char('c')),
+    bind("y", "copy as DynamoDB JSON", KeyCode::Char('y')),
+    bind("Y", "copy as plain JSON", KeyCode::Char('Y')),
+    bind("E", "export", KeyCode::Char('E')),
+    bind("i", "inspect requests", KeyCode::Char('i')),
+    bind("w", "save this read (Workbench)", KeyCode::Char('w')),
+    bind("o", "saved operations", KeyCode::Char('o')),
+    bind("t", "table details", KeyCode::Char('t')),
+    hint("+ / -", "page size"),
+    hint("←→ / hl", "columns"),
+    bind("s", "plain scan", KeyCode::Char('s')),
+    bind("x", "PartiQL", KeyCode::Char('x')),
+    bind("r", "refresh page", KeyCode::Char('r')),
+    bind("T", "switch theme", KeyCode::Char('T')),
+    bind("Esc", "back to tables", KeyCode::Esc),
+];
+const ITEMS_SEARCH_KEYS: &[Binding] = &[
+    hint("type", "search this page"),
+    hint("↑↓", "move"),
+    hint("Enter", "keep"),
+    hint("Esc", "clear"),
+];
+const ITEM_DETAIL_KEYS: &[Binding] = &[
+    bind("e", "edit", KeyCode::Char('e')),
+    bind("u", "update", KeyCode::Char('u')),
+    bind("v", "DynamoDB / plain JSON", KeyCode::Char('v')),
+    bind("c", "copy as new item", KeyCode::Char('c')),
+    bind("y", "copy as DynamoDB JSON", KeyCode::Char('y')),
+    bind("Y", "copy as plain JSON", KeyCode::Char('Y')),
+    hint("↑↓ / jk", "scroll"),
+    bind("T", "switch theme", KeyCode::Char('T')),
+    bind("Esc", "back", KeyCode::Esc),
+];
+const TEXT_DETAIL_KEYS: &[Binding] = &[
+    hint("↑↓ / jk", "scroll"),
+    hint("PgUp / PgDn", "page"),
+    bind("T", "switch theme", KeyCode::Char('T')),
+    bind("Esc", "back", KeyCode::Esc),
+];
+const FORM_KEYS: &[Binding] = &[
+    hint("Enter", "run"),
+    hint("Tab", "complete / next"),
+    hint("↑↓", "field"),
+    hint("←→", "change"),
+    hint("Esc", "close"),
+];
+const UPDATE_KEYS: &[Binding] = &[
+    hint("Enter", "review"),
+    hint("Tab", "complete / switch"),
+    hint("Esc", "cancel"),
+];
+const PARTIQL_KEYS: &[Binding] = &[hint("Enter", "run"), hint("Esc", "back")];
+const LIST_POPUP_KEYS: &[Binding] = &[
+    hint("Enter", "choose"),
+    hint("↑↓ / jk", "move"),
+    hint("Esc", "back"),
+];
+const PROMPT_KEYS: &[Binding] = &[hint("Enter", "write"), hint("Esc", "cancel")];
+const CONFIRM_KEYS: &[Binding] = &[hint("y", "yes"), hint("n / Esc", "cancel")];
+const PALETTE_KEYS: &[Binding] = &[
+    hint("type", "filter"),
+    hint("↑↓", "move"),
+    hint("Enter", "run"),
+    hint("Esc", "close"),
+];
+
+/// The command palette (Ctrl+P): the current screen's commands and every table, filtered
+/// by what has been typed.
+#[derive(Default)]
+pub struct Palette {
+    pub query: String,
+    pub selected: usize,
+}
+
+pub struct PaletteEntry {
+    pub label: String,
+    pub keys: &'static str,
+    action: PaletteAction,
+}
+
+enum PaletteAction {
+    Key(KeyCode),
+    OpenTable(String),
 }
 
 /// What the external editor is being used for.
@@ -99,9 +263,11 @@ pub enum Confirm {
         create: bool,
         key_changed: bool,
     },
+    /// `hidden`: how many of the marked rows the quick search does not show.
     Delete {
         table: String,
         keys: Vec<Item>,
+        hidden: usize,
     },
     Update(ddb::UpdateRequest),
 }
@@ -133,6 +299,11 @@ pub struct App {
     pub connections: Vec<Connection>,
     pub conn_state: ListState,
     pub conn_label: String,
+    /// Region, account and credential kind of each profile, for the connection list.
+    pub profile_info: HashMap<String, ProfileInfo>,
+    /// Search over the connection list; `conn_filtering` while typing it.
+    pub conn_filter: String,
+    pub conn_filtering: bool,
     pub region: String,
     pub region_state: ListState,
     pub tables: Vec<String>,
@@ -150,7 +321,18 @@ pub struct App {
     pub marked: BTreeSet<usize>,
     pub detail: Option<Item>,
     pub detail_title: String,
+    pub detail_kind: DetailKind,
+    /// Show the item as plain JSON instead of DynamoDB JSON.
+    pub detail_plain: bool,
+    /// Quick search over the rows of the current page; `finding` while typing it.
+    pub find: String,
+    pub finding: bool,
+    /// The field and message of the last rejected read form.
+    pub form_error: Option<(Field, String)>,
+    /// The last rejected update: whether it was the condition, and why.
+    pub update_error: Option<(bool, String)>,
     pub detail_text: String,
+    pub details: Option<details::TableDetails>,
     pub detail_scroll: u16,
     pub form: ReadForm,
     pub partiql: String,
@@ -162,7 +344,9 @@ pub struct App {
     pub saved: Vec<saved::Entry>,
     pub saved_state: ListState,
     pub show_help: bool,
+    pub palette: Option<Palette>,
     pub status: Status,
+    status_at: Instant,
     /// Requests in flight; drives the loading indicator.
     pub busy: u32,
     pub quit: bool,
@@ -198,6 +382,9 @@ impl App {
             conn_state: ListState::default().with_selected((!connections.is_empty()).then_some(0)),
             connections,
             conn_label: String::new(),
+            profile_info: HashMap::new(),
+            conn_filter: String::new(),
+            conn_filtering: false,
             region: String::new(),
             region_state: ListState::default(),
             tables: Vec::new(),
@@ -213,7 +400,14 @@ impl App {
             marked: BTreeSet::new(),
             detail: None,
             detail_title: String::new(),
+            detail_kind: DetailKind::Item,
+            detail_plain: false,
+            find: String::new(),
+            finding: false,
+            form_error: None,
+            update_error: None,
             detail_text: String::new(),
+            details: None,
             detail_scroll: 0,
             form: ReadForm::default(),
             partiql: String::new(),
@@ -224,7 +418,9 @@ impl App {
             saved: Vec::new(),
             saved_state: ListState::default(),
             show_help: false,
+            palette: None,
             status: Status::Info(String::new()),
+            status_at: Instant::now(),
             busy: 0,
             quit: false,
             client: None,
@@ -261,8 +457,125 @@ impl App {
         self.pager.page().map(|p| p.items.as_slice()).unwrap_or(&[])
     }
 
-    fn selected_item(&self) -> Option<&Item> {
-        self.item_state.selected().and_then(|i| self.items().get(i))
+    /// Rows of the current page that match the quick search, as indexes into `items()`.
+    pub fn visible_rows(&self) -> Vec<usize> {
+        let needle = self.find.to_lowercase();
+        (0..self.items().len())
+            .filter(|&i| {
+                needle.is_empty()
+                    || self.items()[i]
+                        .values()
+                        .any(|v| item::cell(v).to_lowercase().contains(&needle))
+            })
+            .collect()
+    }
+
+    /// The selected row as an index into `items()`.
+    fn selected_index(&self) -> Option<usize> {
+        let row = self.item_state.selected()?;
+        self.visible_rows().get(row).copied()
+    }
+
+    pub fn selected_item(&self) -> Option<&Item> {
+        self.selected_index().and_then(|i| self.items().get(i))
+    }
+
+    pub fn cached_table(&self, name: &str) -> Option<&TableInfo> {
+        self.table_cache.get(name)
+    }
+
+    /// The keys that apply right now, for the footer and the key list.
+    pub fn bindings(&self) -> &'static [Binding] {
+        if self.palette.is_some() {
+            PALETTE_KEYS
+        } else if self.prompt.is_some() {
+            PROMPT_KEYS
+        } else if self.confirm.is_some() {
+            CONFIRM_KEYS
+        } else if self.conn_filtering && self.screen == Screen::Connections {
+            CONNECTIONS_SEARCH_KEYS
+        } else if self.filtering && self.screen == Screen::Tables {
+            TABLES_SEARCH_KEYS
+        } else if self.finding && self.screen == Screen::Items {
+            ITEMS_SEARCH_KEYS
+        } else {
+            self.screen_bindings()
+        }
+    }
+
+    fn screen_bindings(&self) -> &'static [Binding] {
+        match self.screen {
+            Screen::Connections => CONNECTIONS_KEYS,
+            Screen::Tables => TABLES_KEYS,
+            Screen::Items => ITEMS_KEYS,
+            Screen::Detail if self.detail_kind == DetailKind::Item => ITEM_DETAIL_KEYS,
+            Screen::Detail => TEXT_DETAIL_KEYS,
+            Screen::Form => FORM_KEYS,
+            Screen::Update => UPDATE_KEYS,
+            Screen::PartiQL => PARTIQL_KEYS,
+            Screen::Regions | Screen::Saved => LIST_POPUP_KEYS,
+        }
+    }
+
+    /// The palette opens over the browsing screens, not over forms or confirmations.
+    pub fn palette_allowed(&self) -> bool {
+        self.prompt.is_none()
+            && self.confirm.is_none()
+            && matches!(
+                self.screen,
+                Screen::Connections | Screen::Tables | Screen::Items | Screen::Detail
+            )
+    }
+
+    /// Palette entries matching the typed text, substring matches first.
+    pub fn palette_entries(&self) -> Vec<PaletteEntry> {
+        let query = self
+            .palette
+            .as_ref()
+            .map_or(String::new(), |p| p.query.to_lowercase());
+        let mut entries: Vec<PaletteEntry> = self
+            .screen_bindings()
+            .iter()
+            .filter_map(|b| {
+                Some(PaletteEntry {
+                    label: b.label.to_string(),
+                    keys: b.keys,
+                    action: PaletteAction::Key(b.code?),
+                })
+            })
+            .collect();
+        entries.push(PaletteEntry {
+            label: "show all keys".into(),
+            keys: "?",
+            action: PaletteAction::Key(KeyCode::Char('?')),
+        });
+        if self.screen != Screen::Connections {
+            entries.extend(self.tables.iter().map(|t| PaletteEntry {
+                label: format!("open table {t}"),
+                keys: "",
+                action: PaletteAction::OpenTable(t.clone()),
+            }));
+        }
+        entries.retain(|e| fuzzy(&e.label.to_lowercase(), &query));
+        entries.sort_by_key(|e| !e.label.to_lowercase().contains(&query));
+        entries
+    }
+
+    /// The screen whose panes show behind a popup screen such as the form.
+    pub fn base_screen(&self) -> Screen {
+        match self.screen {
+            Screen::Form => Screen::Items,
+            Screen::Update => self.update_return,
+            Screen::PartiQL => self.partiql_return,
+            Screen::Regions => Screen::Tables,
+            Screen::Saved => self.saved_return,
+            s => s,
+        }
+    }
+
+    /// How long the current status message has been showing.
+    pub fn status_age(&self) -> Duration {
+        self.status_at.elapsed()
     }
 
     /// Marked rows, or the selected row when nothing is marked.
@@ -368,6 +681,11 @@ impl App {
     /// spaces; a multi-line paste never runs a statement half-way.
     pub fn on_paste(&mut self, text: &str) {
         let text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        if let Some(palette) = self.palette.as_mut() {
+            palette.query.push_str(&text);
+            palette.selected = 0;
+            return;
+        }
         if let Some(prompt) = self.prompt.as_mut() {
             prompt.text.push_str(&text);
             return;
@@ -384,9 +702,17 @@ impl App {
                     field.push_str(&text);
                 }
             }
+            Screen::Connections if self.conn_filtering => {
+                self.conn_filter.push_str(&text);
+                self.select_first_connection();
+            }
             Screen::Tables if self.filtering => {
                 self.filter.push_str(&text);
                 self.select_first_table();
+            }
+            Screen::Items if self.finding => {
+                self.find.push_str(&text);
+                self.select_first_item();
             }
             _ => {}
         }
@@ -394,7 +720,7 @@ impl App {
 
     pub fn on_copied(&mut self, result: anyhow::Result<&'static str>) {
         match result {
-            Ok(how) => self.info(format!("Copied ({how})")),
+            Ok(how) => self.ok(format!("Copied ({how})")),
             Err(e) => self.error(e),
         }
     }
@@ -469,7 +795,7 @@ impl App {
                 match result {
                     Ok(units) => {
                         let what = if created { "Created" } else { "Saved" };
-                        self.info(format!("{what}{}", wcu(units)));
+                        self.ok(format!("{what}{}", wcu(units)));
                         if let Some(item) = saved
                             && !created
                             && self.screen == Screen::Detail
@@ -484,7 +810,7 @@ impl App {
             Msg::Deleted(report) => {
                 self.marked.clear();
                 if report.failed.is_empty() {
-                    self.info(format!(
+                    self.ok(format!(
                         "Deleted {} item(s){}",
                         report.deleted,
                         wcu(report.consumed)
@@ -499,21 +825,25 @@ impl App {
                 }
                 self.refresh();
             }
-            Msg::Details { table, result } => match result {
-                Ok(text) => {
+            Msg::Details(result) => match result {
+                Ok(d) => {
                     self.info("");
                     self.detail = None;
-                    self.detail_title = format!(" {table} · table details ");
-                    self.detail_text = text;
+                    self.detail_kind = DetailKind::Table;
+                    self.detail_title = format!(" {} · table details ", d.name);
+                    self.details = Some(d);
                     self.detail_scroll = 0;
-                    self.detail_return = self.screen;
+                    // An item opened while the details loaded keeps its own way back.
+                    if self.screen != Screen::Detail {
+                        self.detail_return = self.screen;
+                    }
                     self.screen = Screen::Detail;
                 }
                 Err(e) => self.error(e),
             },
             Msg::Updated(result) => match result {
                 Ok((item, units)) => {
-                    self.info(format!("Updated{}", wcu(units)));
+                    self.ok(format!("Updated{}", wcu(units)));
                     if let Some(item) = item
                         && self.screen == Screen::Detail
                         && self.detail.is_some()
@@ -544,12 +874,33 @@ impl App {
             self.show_help = false;
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            if self.palette_allowed() {
+                self.finding = false;
+                self.filtering = false;
+                self.conn_filtering = false;
+                self.palette = Some(Palette::default());
+            }
+            return;
+        }
+        if self.palette.is_some() {
+            self.key_palette(key.code);
+            return;
+        }
         if self.prompt.is_some() {
             self.key_prompt(key.code);
             return;
         }
         if self.confirm.is_some() {
             self.key_confirm(key.code);
+            return;
+        }
+        let typing = self.finding
+            || self.filtering
+            || self.conn_filtering
+            || matches!(self.screen, Screen::Form | Screen::Update | Screen::PartiQL);
+        if key.code == KeyCode::Char('T') && !typing {
+            self.cycle_theme();
             return;
         }
         match self.screen {
@@ -565,6 +916,54 @@ impl App {
         }
     }
 
+    fn key_palette(&mut self, code: KeyCode) {
+        let count = self.palette_entries().len();
+        let Some(palette) = self.palette.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
+            KeyCode::Down => palette.selected = (palette.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Backspace => {
+                palette.query.pop();
+                palette.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                palette.query.push(c);
+                palette.selected = 0;
+            }
+            KeyCode::Enter => {
+                let chosen = palette.selected;
+                let entry = self.palette_entries().into_iter().nth(chosen);
+                self.palette = None;
+                match entry.map(|e| e.action) {
+                    Some(PaletteAction::Key(code)) => self.on_key(KeyEvent::from(code)),
+                    Some(PaletteAction::OpenTable(name)) => self.jump_to_table(name),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens a table from anywhere, selecting it in the table list too.
+    fn jump_to_table(&mut self, name: String) {
+        self.filter.clear();
+        self.filtering = false;
+        let at = self.visible_tables().iter().position(|t| *t == name);
+        self.table_state.select(at);
+        self.open_table(name);
+    }
+
+    fn cycle_theme(&mut self) {
+        let name = theme::cycle();
+        match theme::save() {
+            Ok(()) => self.ok(format!("Theme {name}")),
+            Err(e) => self.error(format!("Theme {name} (not remembered: {e})")),
+        }
+    }
+
     fn key_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') => match self.confirm.take() {
@@ -574,7 +973,7 @@ impl App {
                     create,
                     ..
                 }) => self.save(table, item, create),
-                Some(Confirm::Delete { table, keys }) => self.delete(table, keys),
+                Some(Confirm::Delete { table, keys, .. }) => self.delete(table, keys),
                 Some(Confirm::Update(req)) => self.update(req),
                 None => {}
             },
@@ -613,21 +1012,91 @@ impl App {
     }
 
     fn key_connections(&mut self, code: KeyCode) {
-        let len = self.connections.len();
+        let len = self.visible_connections().len();
         match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.conn_state
-                    .select(step(self.conn_state.selected(), len, -1))
+            KeyCode::Up => self
+                .conn_state
+                .select(step(self.conn_state.selected(), len, -1)),
+            KeyCode::Down => self
+                .conn_state
+                .select(step(self.conn_state.selected(), len, 1)),
+            KeyCode::Enter => {
+                self.conn_filtering = false;
+                self.connect();
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.conn_state
-                    .select(step(self.conn_state.selected(), len, 1))
+            _ if self.conn_filtering => match code {
+                KeyCode::Char(c) => {
+                    self.conn_filter.push(c);
+                    self.select_first_connection();
+                }
+                KeyCode::Backspace => {
+                    self.conn_filter.pop();
+                    self.select_first_connection();
+                }
+                KeyCode::Esc => {
+                    self.conn_filter.clear();
+                    self.conn_filtering = false;
+                    self.select_first_connection();
+                }
+                _ => {}
+            },
+            KeyCode::Char('k') => self
+                .conn_state
+                .select(step(self.conn_state.selected(), len, -1)),
+            KeyCode::Char('j') => self
+                .conn_state
+                .select(step(self.conn_state.selected(), len, 1)),
+            KeyCode::Char('/') => {
+                self.conn_filter.clear();
+                self.conn_filtering = true;
+                self.select_first_connection();
             }
-            KeyCode::Enter => self.connect(),
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Esc if !self.conn_filter.is_empty() => {
+                self.conn_filter.clear();
+                self.select_first_connection();
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             _ => {}
         }
+    }
+
+    /// Connections matching the search, by name, region, account or credential kind, as
+    /// indexes into `connections`.
+    pub fn visible_connections(&self) -> Vec<usize> {
+        let needle = self.conn_filter.to_lowercase();
+        (0..self.connections.len())
+            .filter(|&i| {
+                let mut text = self.connections[i].label();
+                if let Connection::Profile(name) = &self.connections[i]
+                    && let Some(info) = self.profile_info.get(name)
+                {
+                    for part in [
+                        info.region.as_deref(),
+                        info.account.as_deref(),
+                        Some(info.kind),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        text.push(' ');
+                        text.push_str(part);
+                    }
+                }
+                text.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    /// The connection under the cursor.
+    pub fn selected_connection(&self) -> Option<&Connection> {
+        let i = self.conn_state.selected()?;
+        self.connections.get(*self.visible_connections().get(i)?)
+    }
+
+    fn select_first_connection(&mut self) {
+        let any = !self.visible_connections().is_empty();
+        self.conn_state.select(any.then_some(0));
     }
 
     fn key_tables(&mut self, code: KeyCode) {
@@ -713,8 +1182,38 @@ impl App {
     }
 
     fn key_items(&mut self, code: KeyCode) {
-        let n = self.items().len();
+        let n = self.visible_rows().len();
+        if self.finding {
+            match code {
+                KeyCode::Esc => {
+                    self.find.clear();
+                    self.finding = false;
+                    self.select_first_item();
+                }
+                KeyCode::Enter => self.finding = false,
+                KeyCode::Up => self
+                    .item_state
+                    .select(step(self.item_state.selected(), n, -1)),
+                KeyCode::Down => self
+                    .item_state
+                    .select(step(self.item_state.selected(), n, 1)),
+                KeyCode::Backspace => {
+                    self.find.pop();
+                    self.select_first_item();
+                }
+                KeyCode::Char(c) => {
+                    self.find.push(c);
+                    self.select_first_item();
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
+            KeyCode::Char('/') => {
+                self.find.clear();
+                self.finding = true;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.item_state
                     .select(step(self.item_state.selected(), n, -1))
@@ -789,6 +1288,10 @@ impl App {
                 self.open_partiql(Screen::Items);
             }
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Esc if !self.find.is_empty() => {
+                self.find.clear();
+                self.select_first_item();
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.generation += 1;
                 self.screen = if self.is_partiql() {
@@ -802,7 +1305,11 @@ impl App {
     }
 
     fn key_detail(&mut self, code: KeyCode) {
-        let max = self.detail_text.lines().count().saturating_sub(1) as u16;
+        // Table details are laid out to the screen width, so their drawing caps the scroll.
+        let max = match self.detail_kind {
+            DetailKind::Table => u16::MAX,
+            _ => self.detail_text.lines().count().saturating_sub(1) as u16,
+        };
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(1)
@@ -829,6 +1336,10 @@ impl App {
             }
             KeyCode::Char('y') => self.copy(self.detail.clone(), false),
             KeyCode::Char('Y') => self.copy(self.detail.clone(), true),
+            KeyCode::Char('v') if self.detail_kind == DetailKind::Item => {
+                self.detail_plain = !self.detail_plain;
+                self.render_detail_item();
+            }
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Esc | KeyCode::Char('q') => self.screen = self.detail_return,
             _ => {}
@@ -836,6 +1347,7 @@ impl App {
     }
 
     fn key_form(&mut self, code: KeyCode) {
+        self.form_error = None;
         let Some(table) = self.table.clone() else {
             self.screen = Screen::Items;
             return;
@@ -869,7 +1381,10 @@ impl App {
                     self.start_read(req);
                     self.screen = Screen::Items;
                 }
-                Err(e) => self.error(e),
+                Err(e) => match e.downcast::<FieldError>() {
+                    Ok(fe) => self.form_error = Some((fe.field, fe.message)),
+                    Err(e) => self.error(e),
+                },
             },
             KeyCode::Char(c) => {
                 if let Some(text) = self.form.text_mut(&table) {
@@ -916,15 +1431,10 @@ impl App {
     }
 
     fn connect(&mut self) {
-        let Some(conn) = self
-            .conn_state
-            .selected()
-            .and_then(|i| self.connections.get(i))
-            .cloned()
-        else {
+        let Some(conn) = self.selected_connection().cloned() else {
             return;
         };
-        self.info(format!("Connecting to {}…", conn.label()));
+        self.progress(format!("Connecting to {}…", conn.label()));
         self.spawn(async move {
             let (client, region) = ddb::connect(&conn, None).await;
             let tables = ddb::list_tables(&client).await;
@@ -955,7 +1465,7 @@ impl App {
             return;
         };
         let region = ddb::REGIONS[i].to_string();
-        self.info(format!("Switching to {region}…"));
+        self.progress(format!("Switching to {region}…"));
         self.screen = Screen::Tables;
         self.spawn(async move {
             let (client, region) = ddb::connect(&conn, Some(&region)).await;
@@ -1026,6 +1536,9 @@ impl App {
 
     fn start_read(&mut self, req: ReadRequest) {
         self.info("");
+        // The quick search belongs to the page it was typed on.
+        self.find.clear();
+        self.finding = false;
         self.request = Some(req);
         self.pager.clear();
         self.marked.clear();
@@ -1060,8 +1573,7 @@ impl App {
 
     fn next_page(&mut self) {
         if self.pager.next_cached() {
-            self.marked.clear();
-            self.select_first_item();
+            self.show_moved_page();
             return;
         }
         match self.pager.next_cursor() {
@@ -1074,10 +1586,21 @@ impl App {
         // A next-page fetch still in flight would otherwise land after the wrong page.
         self.generation += 1;
         if self.pager.prev() {
-            self.marked.clear();
-            self.select_first_item();
+            self.show_moved_page();
         } else {
             self.info("First page");
+        }
+    }
+
+    /// After moving to a known page: shows it, or reads it again if its items were dropped
+    /// to save memory.
+    fn show_moved_page(&mut self) {
+        self.marked.clear();
+        if self.pager.needs_fetch() {
+            self.item_state.select(None);
+            self.fetch(self.pager.current_start(), true);
+        } else {
+            self.select_first_item();
         }
     }
 
@@ -1090,13 +1613,12 @@ impl App {
         self.marked.clear();
         if replace {
             self.pager.replace_current(page);
-            let n = self.items().len();
-            self.item_state.select(
-                self.item_state
-                    .selected()
-                    .map(|i| i.min(n.saturating_sub(1)))
-                    .filter(|_| n > 0),
-            );
+            let n = self.visible_rows().len();
+            // A refresh keeps the row; a page read again after being dropped starts at the top.
+            match self.item_state.selected() {
+                Some(i) if n > 0 => self.item_state.select(Some(i.min(n - 1))),
+                _ => self.select_first_item(),
+            }
         } else if !self.pager.is_empty() && page.items.is_empty() {
             self.pager.mark_end();
             self.info("No more items");
@@ -1107,26 +1629,40 @@ impl App {
     }
 
     fn select_first_item(&mut self) {
-        let any = !self.items().is_empty();
+        let any = !self.visible_rows().is_empty();
         self.item_state.select(any.then_some(0));
     }
 
     fn toggle_mark(&mut self) {
-        let Some(i) = self.item_state.selected() else {
+        let (Some(row), Some(i)) = (self.item_state.selected(), self.selected_index()) else {
             return;
         };
         if !self.marked.remove(&i) {
             self.marked.insert(i);
         }
-        self.item_state.select(step(Some(i), self.items().len(), 1));
+        self.item_state
+            .select(step(Some(row), self.visible_rows().len(), 1));
     }
 
     fn set_detail(&mut self, item: Item) {
-        self.detail_title = " Item · DynamoDB JSON ".into();
-        self.detail_text =
-            serde_json::to_string_pretty(&item::item_to_json(&item)).unwrap_or_default();
+        self.detail_kind = DetailKind::Item;
         self.detail = Some(item);
+        self.render_detail_item();
         self.detail_scroll = 0;
+    }
+
+    /// Rebuilds the item text for the current JSON style.
+    fn render_detail_item(&mut self) {
+        let Some(item) = &self.detail else {
+            return;
+        };
+        let (json, style) = if self.detail_plain {
+            (item::item_to_plain_json(item), "plain JSON")
+        } else {
+            (item::item_to_json(item), "DynamoDB JSON")
+        };
+        self.detail_title = format!(" Item · {style} ");
+        self.detail_text = serde_json::to_string_pretty(&json).unwrap_or_default();
     }
 
     /// Moves through `PAGE_SIZES` and restarts the read, since cached pages had the old size.
@@ -1150,11 +1686,8 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.info(format!("Loading details of {table}…"));
-        self.spawn(async move {
-            let result = details::report(&client, &table).await;
-            Msg::Details { table, result }
-        });
+        self.progress(format!("Loading details of {table}…"));
+        self.spawn(async move { Msg::Details(details::load(&client, &table).await) });
     }
 
     /// Shows the request parameters and response metadata of the calls behind this page.
@@ -1168,6 +1701,7 @@ impl App {
             page.calls.len()
         );
         self.detail_text = serde_json::to_string_pretty(&page.calls).unwrap_or_default();
+        self.detail_kind = DetailKind::Json;
         self.detail = None;
         self.detail_scroll = 0;
         self.detail_return = Screen::Items;
@@ -1197,7 +1731,7 @@ impl App {
             self.info("This row lacks the table's key attributes; include them in the projection");
             return;
         };
-        self.info("Loading the full item…");
+        self.progress("Loading the full item…");
         self.spawn(async move {
             Msg::Loaded {
                 kind,
@@ -1234,7 +1768,13 @@ impl App {
             self.info("Some rows lack the table's key attributes; include them in the projection");
             return;
         };
-        self.confirm = Some(Confirm::Delete { table, keys });
+        let visible = self.visible_rows();
+        let hidden = self.marked.iter().filter(|i| !visible.contains(i)).count();
+        self.confirm = Some(Confirm::Delete {
+            table,
+            keys,
+            hidden,
+        });
     }
 
     fn save(&mut self, table: String, item: Item, create: bool) {
@@ -1250,7 +1790,7 @@ impl App {
             }
         };
         self.saving = Some(item.clone());
-        self.info("Saving…");
+        self.progress("Saving…");
         self.spawn(async move {
             Msg::Saved {
                 created: create,
@@ -1263,7 +1803,7 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.info(format!("Deleting {} item(s)…", keys.len()));
+        self.progress(format!("Deleting {} item(s)…", keys.len()));
         self.spawn(async move { Msg::Deleted(ddb::delete_items(&client, &table, keys).await) });
     }
 
@@ -1279,10 +1819,13 @@ impl App {
         self.clipboard = Some(serde_json::to_string_pretty(&value).unwrap_or_default());
     }
 
-    /// Marked rows, or the whole page when nothing is marked.
+    /// Marked rows, or every row the quick search shows when nothing is marked.
     fn export_rows(&self) -> Vec<Item> {
         if self.marked.is_empty() {
-            self.items().to_vec()
+            self.visible_rows()
+                .into_iter()
+                .map(|i| self.items()[i].clone())
+                .collect()
         } else {
             self.target_rows()
         }
@@ -1336,11 +1879,13 @@ impl App {
         self.update_return = back;
         // Texts stay for the next item; focus always starts on the update expression.
         self.update_form.on_condition = false;
+        self.update_error = None;
         self.hint.clear();
         self.screen = Screen::Update;
     }
 
     fn key_update(&mut self, code: KeyCode) {
+        self.update_error = None;
         if code != KeyCode::Tab {
             self.hint.clear();
         }
@@ -1374,22 +1919,27 @@ impl App {
             }
             KeyCode::Enter => match self.update_request() {
                 Ok(req) => self.confirm = Some(Confirm::Update(req)),
-                Err(e) => self.error(e),
+                Err(e) => self.update_error = Some(e),
             },
             _ => {}
         }
     }
 
-    fn update_request(&self) -> anyhow::Result<ddb::UpdateRequest> {
-        use anyhow::Context;
-        let (table, key) = self.update_target.clone().context("No item selected")?;
+    /// The update to confirm, or which field is wrong (`true` for the condition) and why.
+    fn update_request(&self) -> Result<ddb::UpdateRequest, (bool, String)> {
+        let (table, key) = self
+            .update_target
+            .clone()
+            .ok_or((false, "No item selected".to_string()))?;
         let mut ph = Placeholders::default();
-        let update = ph.update(&self.update_form.update).context("Update")?;
+        let update = ph
+            .update(&self.update_form.update)
+            .map_err(|e| (false, format!("{e:#}")))?;
         let cond = self.update_form.condition.trim();
         let condition = (!cond.is_empty())
             .then(|| ph.condition(cond))
             .transpose()
-            .context("Condition")?;
+            .map_err(|e| (true, format!("{e:#}")))?;
         let mut summary = self.update_form.update.trim().to_string();
         if !cond.is_empty() {
             summary.push_str(&format!("  if  {cond}"));
@@ -1410,7 +1960,7 @@ impl App {
             return;
         };
         self.screen = self.update_return;
-        self.info("Updating…");
+        self.progress("Updating…");
         self.spawn(async move { Msg::Updated(ddb::update_item(&client, req).await) });
     }
 
@@ -1480,7 +2030,7 @@ impl App {
             return;
         }
         let table = read.table.clone();
-        self.info(format!("Loading {table}…"));
+        self.progress(format!("Loading {table}…"));
         self.pending_saved = Some(read);
         self.spawn(async move { Msg::Described(ddb::describe(&client, &table).await) });
     }
@@ -1534,7 +2084,7 @@ impl App {
             None => return,
         };
         match result {
-            Ok(path) => self.info(format!("Saved to {}", path.display())),
+            Ok(path) => self.ok(format!("Saved to {}", path.display())),
             Err(e) => self.error(e),
         }
     }
@@ -1543,18 +2093,49 @@ impl App {
         let rows = self.export_rows();
         let (columns, _) = self.columns();
         match export::export(Path::new(path), &columns, &rows) {
-            Ok(()) => self.info(format!("Exported {} items to {path}", rows.len())),
+            Ok(()) => self.ok(format!("Exported {} items to {path}", rows.len())),
             Err(e) => self.error(e),
         }
     }
 
+    fn ok(&mut self, text: impl Into<String>) {
+        self.set_status(Status::Success(text.into()));
+    }
+
     fn info(&mut self, text: impl Into<String>) {
-        self.status = Status::Info(text.into());
+        self.set_status(Status::Info(text.into()));
+    }
+
+    fn progress(&mut self, text: impl Into<String>) {
+        self.set_status(Status::Progress(text.into()));
     }
 
     fn error(&mut self, e: impl std::fmt::Display) {
-        self.status = Status::Error(format!("{e:#}"));
+        self.set_status(Status::Error(format!("{e:#}")));
     }
+
+    fn set_status(&mut self, status: Status) {
+        self.status = status;
+        self.status_at = Instant::now();
+    }
+}
+
+/// Whether a profile name or tag value says production, so the UI can flag it: a word
+/// `prod`, `prd`, `production` or `live` (or `prod2` and the like) between separators, not
+/// preceded by `non` or `pre`. `nonprod`, `pre-prod` and `products` are not production.
+pub fn is_production(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.iter().enumerate().any(|(i, w)| {
+        let numbered = w
+            .strip_prefix("prod")
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
+        let word = matches!(*w, "prod" | "prd" | "production" | "live") || numbered;
+        word && !matches!(i.checked_sub(1).map(|p| words[p]), Some("non" | "pre"))
+    })
 }
 
 /// The form a plain table scan corresponds to.
@@ -1591,6 +2172,12 @@ fn placeholder(ty: &str) -> AttributeValue {
         "B" => AttributeValue::B(Blob::new(Vec::new())),
         _ => AttributeValue::S(String::new()),
     }
+}
+
+/// Whether the characters of `query` appear in `text` in order (both lowercase).
+fn fuzzy(text: &str, query: &str) -> bool {
+    let mut rest = text.chars();
+    query.chars().all(|q| rest.any(|c| c == q))
 }
 
 fn step(selected: Option<usize>, len: usize, delta: isize) -> Option<usize> {
@@ -1806,7 +2393,7 @@ mod tests {
         assert_eq!(app.marked, BTreeSet::from([0, 2]));
 
         press(&mut app, KeyCode::Char('d'));
-        let Some(Confirm::Delete { table, keys }) = &app.confirm else {
+        let Some(Confirm::Delete { table, keys, .. }) = &app.confirm else {
             panic!("expected a delete confirmation")
         };
         assert_eq!(table, "t");
@@ -1892,6 +2479,35 @@ mod tests {
     }
 
     #[test]
+    fn going_back_to_a_dropped_page_reads_it_again() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, Vec::new());
+        app.pager.clear();
+        for i in 0..14 {
+            app.pager
+                .push(page(vec![item(&[("pk", &i.to_string())])], Some("more")));
+        }
+        app.busy = 0;
+        while app.pager.number() > 1 {
+            press(&mut app, KeyCode::Char('p'));
+        }
+        assert!(app.pager.needs_fetch(), "page 1 was dropped to save memory");
+        assert!(app.busy >= 1, "and is being read again");
+        let g = app.generation;
+        app.on_msg(Msg::Page {
+            generation: g,
+            replace: true,
+            result: Ok(page(vec![item(&[("pk", "0")])], Some("more"))),
+        });
+        assert_eq!(app.items()[0]["pk"], AttributeValue::S("0".into()));
+        assert_eq!(app.item_state.selected(), Some(0));
+        assert!(
+            app.pager.next_cached(),
+            "the pages after it are still known"
+        );
+    }
+
+    #[test]
     fn page_size_steps_and_restarts_the_read() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut app = table_app(&rt, vec![item(&[("pk", "a")])]);
@@ -1968,6 +2584,188 @@ mod tests {
             Field::Projection,
             "nothing left to complete"
         );
+    }
+
+    #[test]
+    fn production_is_recognized_by_word() {
+        for name in [
+            "acme-apac-prod",
+            "acme-team-prod_readonly",
+            "PROD",
+            "team.prd",
+            "eu-production",
+            "shop-live",
+            "prod2-kr",
+        ] {
+            assert!(is_production(name), "{name}");
+        }
+        for name in [
+            "acme-apac-nonprod",
+            "non-prod",
+            "non_prod",
+            "pre-prod",
+            "preprod",
+            "products-dev",
+            "reproduce",
+            "delivery",
+            "",
+        ] {
+            assert!(!is_production(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_new_read_drops_the_quick_search() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, vec![item(&[("pk", "a")])]);
+        app.find = "alice".into();
+        app.start_read(ReadRequest::scan("other"));
+        assert!(app.find.is_empty() && !app.finding);
+    }
+
+    #[test]
+    fn details_arriving_over_an_open_item_keep_its_way_back() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, vec![item(&[("pk", "a")])]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Detail);
+        app.on_msg(Msg::Details(Ok(crate::details::TableDetails {
+            name: "t".into(),
+            status: "ACTIVE".into(),
+            arn: String::new(),
+            item_count: 0,
+            size_bytes: 0,
+            keys: Vec::new(),
+            capacity: None,
+            protection: Vec::new(),
+            settings: Vec::new(),
+            global_indexes: Vec::new(),
+            local_indexes: Vec::new(),
+            tags: Ok(Vec::new()),
+        })));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Items, "not stuck on the detail screen");
+    }
+
+    #[test]
+    fn the_palette_ends_a_profile_search() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            vec![Connection::Profile("dev".into())],
+            rt.handle().clone(),
+            tx,
+        );
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('d'));
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for c in "quit".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.quit,
+            "the command ran instead of being typed into the search"
+        );
+    }
+
+    #[test]
+    fn delete_says_when_marked_rows_are_hidden_by_the_search() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rows: Vec<Item> = ["alice", "bob"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut it = item(&[("pk", "u"), ("name", name)]);
+                it.insert("sk".into(), AttributeValue::N(i.to_string()));
+                it
+            })
+            .collect();
+        let mut app = table_app(&rt, rows);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        app.find = "bob".into();
+        app.item_state.select(Some(0));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(
+            app.confirm,
+            Some(Confirm::Delete { ref keys, hidden: 1, .. }) if keys.len() == 2
+        ));
+    }
+
+    #[test]
+    fn connections_search_names_regions_and_accounts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            vec![
+                Connection::Profile("dev".into()),
+                Connection::Profile("prod".into()),
+                Connection::Local("http://localhost:8000".into()),
+            ],
+            rt.handle().clone(),
+            tx,
+        );
+        app.profile_info.insert(
+            "prod".into(),
+            ProfileInfo {
+                region: Some("ap-northeast-2".into()),
+                account: Some("111122223333".into()),
+                kind: "SSO",
+            },
+        );
+        press(&mut app, KeyCode::Char('/'));
+        for c in "2223".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(
+            app.selected_connection(),
+            Some(&Connection::Profile("prod".into()))
+        );
+        press(&mut app, KeyCode::Esc);
+        for c in "northeast".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(
+            app.visible_connections().len(),
+            3,
+            "typing outside search moves only"
+        );
+        press(&mut app, KeyCode::Char('/'));
+        for c in "northeast".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.visible_connections(), [1], "by region");
+    }
+
+    #[test]
+    fn palette_runs_the_chosen_command() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, vec![item(&[("pk", "a")])]);
+        app.tables = vec!["t".into(), "orders".into()];
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for c in "exprt".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let labels: Vec<String> = app.palette_entries().into_iter().map(|e| e.label).collect();
+        assert_eq!(labels, ["export"], "fuzzy match");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert!(app.prompt.is_some(), "the export prompt opened");
+    }
+
+    #[test]
+    fn palette_lists_tables_and_prefers_substring_matches() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, vec![]);
+        app.tables = vec!["Orders".into(), "Users".into()];
+        app.palette = Some(Palette {
+            query: "orders".into(),
+            selected: 0,
+        });
+        let labels: Vec<String> = app.palette_entries().into_iter().map(|e| e.label).collect();
+        assert_eq!(labels[0], "open table Orders");
+        assert!(!labels.iter().any(|l| l.contains("Users")));
     }
 
     #[test]

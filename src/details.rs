@@ -1,8 +1,7 @@
-//! A readable summary of a table's configuration: the things worth checking before touching
-//! a production table, such as deletion protection, encryption, TTL, backups and tags.
+//! A summary of a table's configuration: the things worth checking before touching a
+//! production table, such as size, keys, indexes, deletion protection, backups and tags.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
 use aws_sdk_dynamodb::Client;
@@ -11,9 +10,73 @@ use aws_sdk_dynamodb::types::{KeySchemaElement, Projection, ProvisionedThroughpu
 
 use crate::ddb::sdk_err;
 
+pub struct TableDetails {
+    pub name: String,
+    pub status: String,
+    pub arn: String,
+    /// Item count and size are estimates DynamoDB refreshes about every six hours.
+    pub item_count: i64,
+    pub size_bytes: i64,
+    pub keys: Vec<KeyPart>,
+    /// Provisioned read and write units; `None` for on-demand tables.
+    pub capacity: Option<(i64, i64)>,
+    /// Deletion protection, point-in-time recovery and encryption.
+    pub protection: Vec<Setting>,
+    /// Table class, stream, TTL and creation time.
+    pub settings: Vec<Setting>,
+    pub global_indexes: Vec<IndexDetails>,
+    pub local_indexes: Vec<IndexDetails>,
+    /// The tags, or why they could not be read.
+    pub tags: Result<Vec<(String, String)>, String>,
+}
+
+pub struct KeyPart {
+    pub name: String,
+    pub ty: String,
+    /// The sort (range) key rather than the partition (hash) key.
+    pub sort: bool,
+}
+
+pub struct IndexDetails {
+    pub name: String,
+    pub keys: Vec<KeyPart>,
+    pub projection: String,
+    /// Empty for local indexes, which share the table's status.
+    pub status: String,
+    pub item_count: i64,
+    pub size_bytes: i64,
+    pub capacity: Option<(i64, i64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    On,
+    Off,
+    /// A value that is neither on nor off, such as the table class.
+    Plain,
+    /// The lookup failed, for example for lack of permission.
+    Unavailable,
+}
+
+pub struct Setting {
+    pub label: &'static str,
+    pub value: String,
+    pub state: State,
+}
+
+impl Setting {
+    fn new(label: &'static str, value: impl Into<String>, state: State) -> Self {
+        Self {
+            label,
+            value: value.into(),
+            state,
+        }
+    }
+}
+
 /// DescribeTable plus TTL, point-in-time recovery and tags. Only DescribeTable must succeed;
-/// the other lookups report their own errors inline (for example a missing permission).
-pub async fn report(client: &Client, table: &str) -> Result<String> {
+/// the other lookups report their own errors in place.
+pub async fn load(client: &Client, table: &str) -> Result<TableDetails> {
     let out = client
         .describe_table()
         .table_name(table)
@@ -21,14 +84,14 @@ pub async fn report(client: &Client, table: &str) -> Result<String> {
         .await
         .map_err(sdk_err)?;
     let t = out.table().context("DescribeTable returned no table")?;
-    let arn = t.table_arn().unwrap_or_default();
+    let arn = t.table_arn().unwrap_or_default().to_string();
     let (ttl, pitr, tags) = tokio::join!(
         client.describe_time_to_live().table_name(table).send(),
         client
             .describe_continuous_backups()
             .table_name(table)
             .send(),
-        list_tags(client, arn),
+        list_tags(client, &arn),
     );
 
     let types: HashMap<&str, &str> = t
@@ -39,165 +102,166 @@ pub async fn report(client: &Client, table: &str) -> Result<String> {
     let keys = |schema: &[KeySchemaElement]| {
         schema
             .iter()
-            .map(|k| {
-                let ty = types.get(k.attribute_name()).copied().unwrap_or("?");
-                format!("{} ({ty}, {})", k.attribute_name(), k.key_type().as_str())
+            .map(|k| KeyPart {
+                name: k.attribute_name().to_string(),
+                ty: types
+                    .get(k.attribute_name())
+                    .copied()
+                    .unwrap_or("?")
+                    .to_string(),
+                sort: k.key_type().as_str() == "RANGE",
             })
             .collect::<Vec<_>>()
-            .join(" · ")
     };
 
-    let mut s = String::new();
-    let mut row = |label: &str, value: String| {
-        let _ = writeln!(s, " {label:<24}{value}");
-    };
-    let status = t.table_status().map(|s| s.as_str()).unwrap_or("?");
-    row("Table", format!("{table}  ({status})"));
-    row("ARN", arn.to_string());
-    row(
-        "Items · size",
-        format!(
-            "~{} items · {}  (DynamoDB refreshes these about every 6 hours)",
-            t.item_count().unwrap_or(0),
-            bytes(t.table_size_bytes().unwrap_or(0))
-        ),
-    );
-    row("Keys", keys(t.key_schema()));
     let billing = t
         .billing_mode_summary()
         .and_then(|b| b.billing_mode())
         .map(|b| b.as_str())
         .unwrap_or("PROVISIONED");
-    let billing = match capacity(t.provisioned_throughput()) {
-        Some(c) if billing == "PROVISIONED" => format!("{billing} · {c}"),
-        _ => billing.to_string(),
-    };
-    row("Billing", billing);
-    row(
-        "Table class",
-        t.table_class_summary()
-            .and_then(|c| c.table_class())
-            .map(|c| c.as_str().to_string())
-            .unwrap_or_else(|| "STANDARD".into()),
-    );
-    row(
-        "Deletion protection",
-        on_off(t.deletion_protection_enabled().unwrap_or(false)),
-    );
-    let encryption = match t.sse_description() {
-        None => "AWS owned key (default)".to_string(),
-        Some(d) => {
-            let ty = d.sse_type().map(|t| t.as_str()).unwrap_or("?");
-            let status = d.status().map(|s| s.as_str()).unwrap_or("?");
-            match d.kms_master_key_arn() {
-                Some(key) => format!("{ty} · {status} · {key}"),
-                None => format!("{ty} · {status}"),
-            }
-        }
-    };
-    row("Encryption", encryption);
-    let stream = match t.stream_specification() {
-        Some(spec) if spec.stream_enabled() => format!(
-            "on · {}",
-            spec.stream_view_type().map(|v| v.as_str()).unwrap_or("?")
-        ),
-        _ => "off".to_string(),
-    };
-    row("Stream", stream);
-    let ttl = match ttl {
-        Ok(out) => match out.time_to_live_description() {
-            Some(d) => {
-                let status = d.time_to_live_status().map(|s| s.as_str()).unwrap_or("?");
-                match d.attribute_name() {
-                    Some(attr) => format!("{status} · attribute {attr}"),
-                    None => status.to_string(),
-                }
-            }
-            None => "?".to_string(),
-        },
-        Err(e) => format!("unavailable: {:#}", sdk_err(e)),
-    };
-    row("TTL", ttl);
+    let table_capacity = capacity(t.provisioned_throughput()).filter(|_| billing == "PROVISIONED");
+
+    let deletion = t.deletion_protection_enabled().unwrap_or(false);
     let pitr = match pitr {
         Ok(out) => match out
             .continuous_backups_description()
             .and_then(|d| d.point_in_time_recovery_description())
         {
-            Some(p) => {
-                let status = p
-                    .point_in_time_recovery_status()
-                    .map(|s| s.as_str())
-                    .unwrap_or("?");
-                match p.earliest_restorable_date_time() {
-                    Some(d) => format!("{status} · restorable from {}", date(d)),
-                    None => status.to_string(),
+            Some(p) if p.point_in_time_recovery_status().map(|s| s.as_str()) == Some("ENABLED") => {
+                let value = match p.earliest_restorable_date_time() {
+                    Some(d) => format!("on · restorable from {}", date(d)),
+                    None => "on".to_string(),
+                };
+                Setting::new("Point-in-time recovery", value, State::On)
+            }
+            Some(_) => Setting::new("Point-in-time recovery", "off", State::Off),
+            None => Setting::new("Point-in-time recovery", "?", State::Plain),
+        },
+        Err(e) => unavailable("Point-in-time recovery", sdk_err(e)),
+    };
+    let encryption = match t.sse_description() {
+        None => Setting::new("Encryption", "AWS owned key (default)", State::Plain),
+        Some(d) => {
+            let ty = d.sse_type().map(|t| t.as_str()).unwrap_or("?");
+            let status = d.status().map(|s| s.as_str()).unwrap_or("?");
+            let value = match d.kms_master_key_arn() {
+                Some(key) => format!("{ty} · {status} · {key}"),
+                None => format!("{ty} · {status}"),
+            };
+            Setting::new("Encryption", value, State::On)
+        }
+    };
+    let protection = vec![
+        Setting::new(
+            "Deletion protection",
+            if deletion { "on" } else { "off" },
+            if deletion { State::On } else { State::Off },
+        ),
+        pitr,
+        encryption,
+    ];
+
+    let stream = match t.stream_specification() {
+        Some(spec) if spec.stream_enabled() => Setting::new(
+            "Stream",
+            format!(
+                "on · {}",
+                spec.stream_view_type().map(|v| v.as_str()).unwrap_or("?")
+            ),
+            State::On,
+        ),
+        _ => Setting::new("Stream", "off", State::Off),
+    };
+    let ttl = match ttl {
+        Ok(out) => match out.time_to_live_description() {
+            Some(d) => {
+                let status = d.time_to_live_status().map(|s| s.as_str()).unwrap_or("?");
+                let attr = d.attribute_name().map(|a| format!(" · attribute {a}"));
+                match status {
+                    "ENABLED" => {
+                        Setting::new("TTL", format!("on{}", attr.unwrap_or_default()), State::On)
+                    }
+                    "DISABLED" => Setting::new("TTL", "off", State::Off),
+                    other => Setting::new(
+                        "TTL",
+                        format!("{}{}", other.to_lowercase(), attr.unwrap_or_default()),
+                        State::Plain,
+                    ),
                 }
             }
-            None => "?".to_string(),
+            None => Setting::new("TTL", "?", State::Plain),
         },
-        Err(e) => format!("unavailable: {:#}", sdk_err(e)),
+        Err(e) => unavailable("TTL", sdk_err(e)),
     };
-    row("Point-in-time recovery", pitr);
-    row(
-        "Created",
-        t.creation_date_time().map(date).unwrap_or_default(),
-    );
+    let settings = vec![
+        Setting::new(
+            "Table class",
+            t.table_class_summary()
+                .and_then(|c| c.table_class())
+                .map(|c| c.as_str().to_string())
+                .unwrap_or_else(|| "STANDARD".into()),
+            State::Plain,
+        ),
+        stream,
+        ttl,
+        Setting::new(
+            "Created",
+            t.creation_date_time().map(date).unwrap_or_default(),
+            State::Plain,
+        ),
+    ];
 
-    let mut section = |title: &str, lines: Vec<String>| {
-        let _ = writeln!(s, "\n {title}");
-        if lines.is_empty() {
-            let _ = writeln!(s, "   (none)");
-        }
-        for l in lines {
-            let _ = writeln!(s, "   {l}");
-        }
-    };
-    section(
-        "Global secondary indexes",
-        t.global_secondary_indexes()
-            .iter()
-            .map(|g| {
-                let mut line = format!(
-                    "{} · {} · {} · {} · ~{} items",
-                    g.index_name().unwrap_or("?"),
-                    keys(g.key_schema()),
-                    projection(g.projection()),
-                    g.index_status().map(|s| s.as_str()).unwrap_or("?"),
-                    g.item_count().unwrap_or(0)
-                );
-                if let Some(c) = capacity(g.provisioned_throughput()) {
-                    line.push_str(&format!(" · {c}"));
-                }
-                line
-            })
-            .collect(),
-    );
-    section(
-        "Local secondary indexes",
-        t.local_secondary_indexes()
-            .iter()
-            .map(|l| {
-                format!(
-                    "{} · {} · {} · ~{} items",
-                    l.index_name().unwrap_or("?"),
-                    keys(l.key_schema()),
-                    projection(l.projection()),
-                    l.item_count().unwrap_or(0)
-                )
-            })
-            .collect(),
-    );
-    section(
-        "Tags",
-        match tags {
-            Ok(tags) => tags
-                .into_iter()
-                .map(|(k, v)| format!("{k} = {v}"))
-                .collect(),
-            Err(e) => vec![format!("unavailable: {e:#}")],
-        },
-    );
-    Ok(s)
+    let global_indexes = t
+        .global_secondary_indexes()
+        .iter()
+        .map(|g| IndexDetails {
+            name: g.index_name().unwrap_or("?").to_string(),
+            keys: keys(g.key_schema()),
+            projection: projection(g.projection()),
+            status: g
+                .index_status()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default(),
+            item_count: g.item_count().unwrap_or(0),
+            size_bytes: g.index_size_bytes().unwrap_or(0),
+            capacity: capacity(g.provisioned_throughput()).filter(|_| billing == "PROVISIONED"),
+        })
+        .collect();
+    let local_indexes = t
+        .local_secondary_indexes()
+        .iter()
+        .map(|l| IndexDetails {
+            name: l.index_name().unwrap_or("?").to_string(),
+            keys: keys(l.key_schema()),
+            projection: projection(l.projection()),
+            status: String::new(),
+            item_count: l.item_count().unwrap_or(0),
+            size_bytes: l.index_size_bytes().unwrap_or(0),
+            capacity: None,
+        })
+        .collect();
+
+    Ok(TableDetails {
+        name: table.to_string(),
+        status: t
+            .table_status()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "?".into()),
+        arn,
+        item_count: t.item_count().unwrap_or(0),
+        size_bytes: t.table_size_bytes().unwrap_or(0),
+        keys: keys(t.key_schema()),
+        capacity: table_capacity,
+        protection,
+        settings,
+        global_indexes,
+        local_indexes,
+        tags: tags.map_err(|e| format!("{e:#}")),
+    })
+}
+
+fn unavailable(label: &'static str, e: anyhow::Error) -> Setting {
+    Setting::new(label, format!("unavailable: {e:#}"), State::Unavailable)
 }
 
 async fn list_tags(client: &Client, arn: &str) -> Result<Vec<(String, String)>> {
@@ -224,14 +288,14 @@ async fn list_tags(client: &Client, arn: &str) -> Result<Vec<(String, String)>> 
     }
 }
 
-/// Provisioned read/write units; on-demand tables report zeros, which are omitted.
-fn capacity(p: Option<&ProvisionedThroughputDescription>) -> Option<String> {
+/// Provisioned read/write units; on-demand tables report zeros, which mean none.
+fn capacity(p: Option<&ProvisionedThroughputDescription>) -> Option<(i64, i64)> {
     let p = p?;
     let (r, w) = (
         p.read_capacity_units().unwrap_or(0),
         p.write_capacity_units().unwrap_or(0),
     );
-    (r > 0 || w > 0).then(|| format!("read {r} / write {w}"))
+    (r > 0 || w > 0).then_some((r, w))
 }
 
 fn projection(p: Option<&Projection>) -> String {
@@ -244,15 +308,16 @@ fn projection(p: Option<&Projection>) -> String {
     }
 }
 
-fn on_off(b: bool) -> String {
-    if b { "on" } else { "off" }.to_string()
-}
-
+/// `2026-10-21 05:36 UTC`.
 fn date(d: &DateTime) -> String {
-    d.fmt(DateTimeFormat::DateTime).unwrap_or_default()
+    let full = d.fmt(DateTimeFormat::DateTime).unwrap_or_default();
+    match full.get(..16) {
+        Some(minutes) => format!("{} UTC", minutes.replace('T', " ")),
+        None => full,
+    }
 }
 
-fn bytes(n: i64) -> String {
+pub fn bytes(n: i64) -> String {
     let n = n as f64;
     match n {
         n if n >= 1e9 => format!("{:.1} GB", n / 1e9),
@@ -283,5 +348,11 @@ mod tests {
             .build();
         assert_eq!(projection(Some(&p)), "INCLUDE (a, b)");
         assert_eq!(projection(None), "?");
+    }
+
+    #[test]
+    fn dates_read_to_the_minute() {
+        let d = DateTime::from_secs(1_792_560_998);
+        assert_eq!(date(&d), "2026-10-21 05:36 UTC");
     }
 }

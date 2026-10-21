@@ -2,15 +2,26 @@
 
 A fast terminal UI for Amazon DynamoDB.
 
-- Browse tables and page through Scan/Query results; earlier pages come from a cache, and short
-  pages (from filters or the 1 MB limit) are filled automatically.
+- One workspace: the table list, the item grid and the selected item side by side. Narrow
+  terminals fold the outer panes away.
+- Values read by type: numbers right-aligned, nested maps and lists folded into `{3}` and `[2]`,
+  status-like columns with colored dots.
+- A command palette (`Ctrl+P`) for every command and for jumping to any table.
+- Themes: Tokyo Night, Catppuccin Mocha and Catppuccin Latte, in 24-bit color with a 256-color
+  fallback.
+- Browse tables and page through Scan/Query results; recent pages come from a cache (up to 10
+  pages and 32 MB, so paging through a large table does not grow memory without bound; older
+  pages are read again), and short pages (from filters or the 1 MB limit) are filled
+  automatically.
 - Scan/Query with filters, projections, consistent reads, sort order and secondary indexes,
   written in DynamoDB's own expression syntax.
 - Edit items in `$EDITOR`, create, duplicate, delete (one or many) and run UpdateItem
   expressions, all behind a confirmation.
 - PartiQL, table details (keys, indexes, capacity, deletion protection, encryption, TTL,
   point-in-time recovery, tags), consumed capacity per page and the requests behind it.
-- Copy items as JSON, export a page to CSV or JSON, switch regions.
+- Search the table list or the loaded page as you type, with matches highlighted.
+- View items as DynamoDB JSON or plain JSON, copy them, export a page to CSV or JSON, switch
+  regions.
 - Reads and writes [NoSQL Workbench](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/workbench.html)
   saved operations, so the two tools share them.
 
@@ -29,22 +40,32 @@ or from a checkout: `cargo build --release` and run `target/release/ddb-tui`.
 ```sh
 ddb-tui                                     # AWS profiles from ~/.aws/config and ~/.aws/credentials
 ddb-tui --endpoint http://localhost:8000    # endpoint for the DynamoDB Local entry
+ddb-tui --theme catppuccin-latte            # tokyo-night (default), catppuccin-mocha, catppuccin-latte
 ```
 
-The connection list shows every profile plus a DynamoDB Local entry. Profiles are resolved by the
+The connection list shows every profile with its region, account and credential type (read from
+`~/.aws/config`; secrets are never read), plus a DynamoDB Local entry. `/` searches it by any of
+these, and profiles whose name says production are flagged. Profiles are resolved by the
 AWS SDK, so SSO, assume-role and `credential_process` profiles work; credential environment
 variables are ignored in favor of the selected profile. A profile without a region starts in
 `us-east-1`; press `R` to switch.
 
+`T` switches the theme while running and remembers the choice in `~/.config/ddb-tui/theme`
+(`$XDG_CONFIG_HOME` when set). Terminals that do not set `COLORTERM=truecolor` get the nearest
+256-color palette.
+
 ## Keys
 
-Press `?` on any screen for its full key list. The most used ones:
+Press `?` on any screen for its full key list, or `Ctrl+P` to search the commands. The most used
+ones:
 
 | Screen | Keys |
 |---|---|
-| Tables | `Enter` open (scan) · `/` filter · `t` details · `x` PartiQL · `R` region · `o` saved operations |
-| Items | `n`/`p` page · `Enter` view · `f` scan/query form · `e` edit · `u` update · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` columns |
-| Detail | `e` edit · `u` update · `c` copy as new · `y`/`Y` copy JSON |
+| Anywhere | `Ctrl+P` command palette · `T` theme · `?` keys |
+| Connections | `/` search profile, region or account · `Enter` connect |
+| Tables | `Enter` open (scan) · `/` search · `t` details · `x` PartiQL · `R` region · `o` saved operations |
+| Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` columns |
+| Detail | `v` DynamoDB / plain JSON · `e` edit · `u` update · `c` copy as new · `y`/`Y` copy JSON |
 | Forms | `Tab` complete attribute name or next field · `←`/`→` change choice · `Enter` run |
 
 ## Expressions

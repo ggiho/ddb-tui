@@ -291,25 +291,46 @@ async fn updates_and_saved_reads(
 }
 
 async fn table_details(client: &Client, table: &str) -> Result<()> {
-    let text = ddb_tui::details::report(client, table).await?;
+    let d = ddb_tui::details::load(client, table).await?;
+    assert_eq!(d.name, table);
+    let keys: Vec<(&str, &str, bool)> = d
+        .keys
+        .iter()
+        .map(|k| (k.name.as_str(), k.ty.as_str(), k.sort))
+        .collect();
+    assert_eq!(keys, [("pk", "S", false), ("sk", "N", true)]);
+    assert_eq!(d.capacity, None, "on-demand");
+    let gsi = &d.global_indexes[0];
+    assert_eq!(
+        (
+            gsi.name.as_str(),
+            gsi.keys[0].name.as_str(),
+            gsi.projection.as_str()
+        ),
+        ("by_type", "type", "ALL")
+    );
+    let labels: Vec<&str> = d
+        .protection
+        .iter()
+        .chain(&d.settings)
+        .map(|s| s.label)
+        .collect();
     for expected in [
-        table,
-        "pk (S, HASH) · sk (N, RANGE)",
-        "PAY_PER_REQUEST",
-        "by_type · type (S, HASH) · sk (N, RANGE) · ALL",
         "Deletion protection",
-        "TTL",
         "Point-in-time recovery",
-        "Tags",
+        "TTL",
+        "Created",
     ] {
-        assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        assert!(
+            labels.contains(&expected),
+            "missing {expected} in {labels:?}"
+        );
     }
     assert!(
-        ddb_tui::details::report(client, "no_such_table")
+        ddb_tui::details::load(client, "no_such_table")
             .await
             .is_err()
     );
-    println!("{text}");
     Ok(())
 }
 

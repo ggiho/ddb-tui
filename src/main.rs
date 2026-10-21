@@ -2,13 +2,13 @@ use std::io::{Write, stdout};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use ddb_tui::app::{App, Msg};
 use ddb_tui::ddb::Connection;
 use ddb_tui::item::{self, Item};
-use ddb_tui::{profiles, ui};
+use ddb_tui::{profiles, theme, ui};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
@@ -29,6 +29,7 @@ fn main() -> Result<()> {
         .collect();
     connections.push(Connection::Local(endpoint));
     let mut app = App::new(connections, rt.handle().clone(), tx);
+    app.profile_info = profiles::profile_info();
 
     let mut terminal = ratatui::init();
     // Pastes arrive as one event, so a newline in pasted text cannot press Enter.
@@ -39,15 +40,26 @@ fn main() -> Result<()> {
     result
 }
 
+/// Reads the arguments and selects the theme: `--theme`, else the one chosen last time.
 fn parse_args() -> Result<String> {
     let mut args = std::env::args().skip(1);
     let mut endpoint = DEFAULT_LOCAL_ENDPOINT.to_string();
+    theme::load_saved();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--endpoint" => endpoint = args.next().context("--endpoint needs a URL")?,
+            "--theme" => {
+                let name = args.next().context("--theme needs a name")?;
+                ensure!(
+                    theme::set(&name),
+                    "unknown theme {name}; choose one of {}",
+                    theme::NAMES.join(", ")
+                );
+            }
             "-h" | "--help" => {
                 println!(
-                    "usage: ddb-tui [--endpoint URL]\n\n  --endpoint URL  DynamoDB Local endpoint (default {DEFAULT_LOCAL_ENDPOINT})"
+                    "usage: ddb-tui [--endpoint URL] [--theme NAME]\n\n  --endpoint URL  DynamoDB Local endpoint (default {DEFAULT_LOCAL_ENDPOINT})\n  --theme NAME    {} (T switches while running)",
+                    theme::NAMES.join(", ")
                 );
                 std::process::exit(0);
             }
@@ -62,17 +74,33 @@ fn run(
     app: &mut App,
     rx: &mut UnboundedReceiver<Msg>,
 ) -> Result<()> {
+    // The screen is redrawn after input and responses; otherwise only to animate the loading
+    // spinner and, once a second, to let toasts expire. An idle screen then costs nothing.
+    let mut dirty = true;
+    let mut last_draw = Instant::now();
     while !app.quit {
         while let Ok(msg) = rx.try_recv() {
             app.on_msg(msg);
+            dirty = true;
         }
-        terminal.draw(|f| ui::draw(f, app))?;
+        let interval = if app.busy > 0 {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_secs(1)
+        };
+        if dirty || last_draw.elapsed() >= interval {
+            terminal.draw(|f| ui::draw(f, app))?;
+            last_draw = Instant::now();
+            dirty = false;
+        }
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
                 Event::Paste(text) => app.on_paste(&text),
                 _ => {}
             }
+            // Resizes and focus changes need a redraw too.
+            dirty = true;
         }
         if let Some(item) = app.take_edit_request() {
             let _ = execute!(stdout(), DisableBracketedPaste);
@@ -82,9 +110,11 @@ fn run(
             execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
             terminal.clear()?;
             app.on_edited(item, result);
+            dirty = true;
         }
         if let Some(text) = app.take_clipboard() {
             app.on_copied(copy_to_clipboard(&text));
+            dirty = true;
         }
     }
     Ok(())

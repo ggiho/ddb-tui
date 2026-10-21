@@ -114,6 +114,28 @@ pub fn item_to_plain_json(item: &Item) -> Value {
     Value::Object(item.iter().map(|(k, v)| (k.clone(), plain(v))).collect())
 }
 
+/// Roughly the item's size as DynamoDB counts it: attribute names plus values.
+pub fn approx_size(item: &Item) -> usize {
+    item.iter().map(|(k, v)| k.len() + value_size(v)).sum()
+}
+
+fn value_size(v: &AttributeValue) -> usize {
+    match v {
+        AttributeValue::S(s) | AttributeValue::N(s) => s.len(),
+        AttributeValue::B(b) => b.as_ref().len(),
+        AttributeValue::Ss(v) | AttributeValue::Ns(v) => v.iter().map(String::len).sum(),
+        AttributeValue::Bs(v) => v.iter().map(|b| b.as_ref().len()).sum(),
+        AttributeValue::L(l) => 3 + l.iter().map(|v| 1 + value_size(v)).sum::<usize>(),
+        AttributeValue::M(m) => {
+            3 + m
+                .iter()
+                .map(|(k, v)| 1 + k.len() + value_size(v))
+                .sum::<usize>()
+        }
+        _ => 1,
+    }
+}
+
 /// Strings and numbers as-is, everything else as compact plain JSON.
 pub fn text(v: &AttributeValue) -> String {
     match v {
@@ -213,6 +235,20 @@ mod tests {
         assert_eq!(cell(&item["s"]), "line1 line2");
         assert_eq!(cell(&item["m"]), r#"{"inner":1.50}"#);
         assert_eq!(cell(&item["ss"]), r#"["a","b"]"#);
+    }
+
+    #[test]
+    fn sizes_count_names_and_values() {
+        let item = Item::from([
+            ("id".to_string(), AttributeValue::S("abc".into())),
+            ("n".to_string(), AttributeValue::N("12".into())),
+            (
+                "m".to_string(),
+                AttributeValue::M(Item::from([("k".to_string(), AttributeValue::Bool(true))])),
+            ),
+        ]);
+        // id+abc = 5, n+12 = 3, m + (3 + 1 + k + true) = 1 + 6 = 7
+        assert_eq!(approx_size(&item), 15);
     }
 
     #[test]
