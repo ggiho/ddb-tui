@@ -241,7 +241,8 @@ fn group_text(g: &Value) -> Result<Option<String>> {
     }))
 }
 
-/// One condition, following Workbench's `convertConditionToString`.
+/// One stored condition as filter text: a comparison, `BETWEEN`, `IN`, or one of the
+/// condition functions, negated when its `negate` flag is set.
 fn condition_text(c: &Value) -> Result<Option<String>> {
     let name = string(&c["attributeName"]);
     if name.is_empty() {
@@ -299,7 +300,7 @@ fn condition_text(c: &Value) -> Result<Option<String>> {
     }))
 }
 
-/// Workbench's `generateAttributeValue`: the raw text interpreted by attribute type.
+/// A stored value: raw text interpreted by its attribute type (sets and lists as JSON).
 fn workbench_value(raw: &str, ty: &str) -> Result<AttributeValue> {
     let json_strings = |raw: &str| -> Result<Vec<String>> {
         let v: Vec<Value> =
