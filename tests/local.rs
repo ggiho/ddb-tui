@@ -288,6 +288,35 @@ async fn updates_and_saved_reads(
     assert!(!a.is_empty());
     assert_eq!(a, b, "saved and reloaded queries return the same items");
     std::fs::remove_dir_all(&dir)?;
+
+    // One update for several items: each one is tried, and failures are listed per key.
+    let keys: Vec<Item> = [1, 2]
+        .map(|i| {
+            Item::from([
+                ("pk".to_string(), s(&format!("user#{i}"))),
+                ("sk".to_string(), n(i)),
+            ])
+        })
+        .into();
+    let once = update("SET batch = 1", Some("attribute_not_exists(batch)"))?;
+    let first = ddb::update_items(client, &once, keys.clone()).await;
+    assert_eq!(
+        (first.updated, first.failed.len()),
+        (2, 0),
+        "{:?}",
+        first.failed
+    );
+    let second = ddb::update_items(client, &once, keys).await;
+    assert_eq!(
+        (second.updated, second.failed.len()),
+        (0, 2),
+        "the condition now fails"
+    );
+    assert!(
+        second.failed[0].contains("condition"),
+        "{}",
+        second.failed[0]
+    );
     Ok(())
 }
 

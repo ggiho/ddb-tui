@@ -748,6 +748,39 @@ pub async fn delete_items(client: &Client, table: &str, keys: Vec<Item>) -> Dele
     report
 }
 
+/// How an UpdateItem applied to several items went.
+#[derive(Debug)]
+pub struct UpdateReport {
+    pub requested: usize,
+    pub updated: usize,
+    /// `key: error` for each item that was not updated, such as a failed condition.
+    pub failed: Vec<String>,
+    pub consumed: Option<f64>,
+}
+
+/// Applies `req` to each key in turn. One failure, such as an unmet condition, does not stop
+/// the others.
+pub async fn update_items(client: &Client, req: &UpdateRequest, keys: Vec<Item>) -> UpdateReport {
+    let mut report = UpdateReport {
+        requested: keys.len(),
+        updated: 0,
+        failed: Vec::new(),
+        consumed: None,
+    };
+    for key in keys {
+        let label = item::item_to_plain_json(&key).to_string();
+        let one = UpdateRequest { key, ..req.clone() };
+        match update_item(client, one).await {
+            Ok((_, units)) => {
+                report.updated += 1;
+                report.consumed = add(report.consumed, units);
+            }
+            Err(e) => report.failed.push(format!("{label}: {e:#}")),
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

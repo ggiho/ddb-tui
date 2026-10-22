@@ -82,7 +82,7 @@ ones:
 | Connections | `/` search profile, region or account · `Enter` connect |
 | Tables | `Enter` open (scan) · `/` search · `t` details · `x` PartiQL · `R` region · `o` saved operations |
 | Export (`E`) | `Tab` this page / all results · `Enter` write · `Esc` cancel (also stops a running export) |
-| Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` cells · `v` copy cell · `g` query by the cell value |
+| Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update (all marked rows when some are marked) · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` cells · `v` copy cell · `g` query by the cell value |
 | Detail | `v` DynamoDB / plain JSON · `e` edit · `u` update · `d` delete · `c` copy as new · `y`/`Y` copy JSON |
 | Forms | `Tab` complete attribute name or next field · `←`/`→` change choice · `Enter` run |
 

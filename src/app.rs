@@ -17,7 +17,9 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::complete;
-use crate::ddb::{self, Connection, Cursor, DeleteReport, Page, ReadRequest, TableInfo};
+use crate::ddb::{
+    self, Connection, Cursor, DeleteReport, Page, ReadRequest, TableInfo, UpdateReport,
+};
 use crate::details;
 use crate::export;
 use crate::expr::Placeholders;
@@ -68,6 +70,8 @@ pub enum Msg {
     },
     Deleted(DeleteReport),
     Details(anyhow::Result<details::TableDetails>),
+    /// One update applied to several marked items.
+    UpdatedMany(UpdateReport),
     /// The updated item (ReturnValues ALL_NEW) and the write capacity used.
     Updated(anyhow::Result<(Option<Item>, Option<f64>)>),
     /// How far a whole-result export has come; not a reply, so it does not end a request.
@@ -320,6 +324,13 @@ pub enum Confirm {
         hidden: usize,
     },
     Update(ddb::UpdateRequest),
+    /// One update for several items; `req.key` is the first of `keys`. `hidden` counts the
+    /// marked items the quick search does not show.
+    UpdateMany {
+        req: ddb::UpdateRequest,
+        keys: Vec<Item>,
+        hidden: usize,
+    },
     /// A PartiQL statement that changes data.
     Statement(String),
     /// Lift read-only mode for the rest of the session.
@@ -444,7 +455,8 @@ pub struct App {
     seen_attrs: HashMap<String, BTreeSet<String>>,
     /// The form behind the current Scan/Query, which is what a saved operation stores.
     last_form: Option<ReadForm>,
-    update_target: Option<(String, Item)>,
+    /// The table, the keys of the items to update and how many of them the search hides.
+    update_target: Option<(String, Vec<Item>, usize)>,
     pub update_return: Screen,
     saved_return: Screen,
     /// A saved Scan/Query waiting for its table's key schema.
@@ -1037,6 +1049,24 @@ impl App {
                 }
                 Err(e) => self.error(e),
             },
+            Msg::UpdatedMany(report) => {
+                self.marked.clear();
+                if report.failed.is_empty() {
+                    self.ok(format!(
+                        "Updated {} items{}",
+                        report.updated,
+                        wcu(report.consumed)
+                    ));
+                } else {
+                    self.error(format!(
+                        "Updated {} of {}; {}",
+                        report.updated,
+                        report.requested,
+                        report.failed.join("; ")
+                    ));
+                }
+                self.refresh();
+            }
             Msg::Loaded { kind, result } => match result {
                 Ok(Some(item)) => {
                     self.info("");
@@ -1224,6 +1254,7 @@ impl App {
                 }) => self.save(table, item, create),
                 Some(Confirm::Delete { table, keys, .. }) => self.delete(table, keys),
                 Some(Confirm::Update(req)) => self.update(req),
+                Some(Confirm::UpdateMany { req, keys, .. }) => self.update_many(req, keys),
                 Some(Confirm::Statement(statement)) => self.run_statement(statement),
                 Some(Confirm::ExportAll { path }) => self.export_all(path),
                 Some(Confirm::AllowWrites) => {
@@ -1515,9 +1546,11 @@ impl App {
             KeyCode::Char('Y') => self.copy(self.selected_item().cloned(), true),
             KeyCode::Char('E') => self.open_export(),
             KeyCode::Char('u') => {
-                if let Some(item) = self.selected_item().cloned() {
-                    self.open_update(item, Screen::Items);
-                }
+                // Marked rows all get the same update; otherwise the selected one.
+                let visible = self.visible_rows();
+                let hidden = self.marked.iter().filter(|i| !visible.contains(i)).count();
+                let rows = self.target_rows();
+                self.open_update(rows, hidden, Screen::Items);
             }
             KeyCode::Char('w') => self.open_save_prompt(),
             KeyCode::Char('o') => self.open_saved(Screen::Items),
@@ -1589,7 +1622,7 @@ impl App {
             }
             KeyCode::Char('u') => {
                 if let Some(item) = self.detail.clone() {
-                    self.open_update(item, Screen::Detail);
+                    self.open_update(vec![item], 0, Screen::Detail);
                 }
             }
             KeyCode::Char('d') => {
@@ -2300,15 +2333,22 @@ impl App {
         names
     }
 
-    fn open_update(&mut self, item: Item, back: Screen) {
+    fn open_update(&mut self, items: Vec<Item>, hidden: usize, back: Screen) {
+        if items.is_empty() {
+            return;
+        }
         let Some((table, info, _)) = self.writable() else {
             return;
         };
-        let Some(key) = ddb::key_of(&item, info.base()) else {
-            self.info("This row lacks the table's key attributes; include them in the projection");
+        let Some(keys) = items
+            .iter()
+            .map(|i| ddb::key_of(i, info.base()))
+            .collect::<Option<Vec<_>>>()
+        else {
+            self.info("A row lacks the table's key attributes; include them in the projection");
             return;
         };
-        self.update_target = Some((table, key));
+        self.update_target = Some((table, keys, hidden));
         self.update_return = back;
         // Texts stay for the next item; focus always starts on the update expression.
         self.update_form.on_condition = false;
@@ -2351,7 +2391,18 @@ impl App {
                 field.pop();
             }
             KeyCode::Enter => match self.update_request() {
-                Ok(req) => self.confirm = Some(Confirm::Update(req)),
+                Ok(req) => {
+                    let (keys, hidden) = self
+                        .update_target
+                        .as_ref()
+                        .map(|(_, keys, hidden)| (keys.clone(), *hidden))
+                        .unwrap_or_default();
+                    self.confirm = Some(if keys.len() > 1 {
+                        Confirm::UpdateMany { req, keys, hidden }
+                    } else {
+                        Confirm::Update(req)
+                    });
+                }
                 Err(e) => self.update_error = Some(e),
             },
             _ => {}
@@ -2362,7 +2413,8 @@ impl App {
     fn update_request(&self) -> Result<ddb::UpdateRequest, (bool, String)> {
         let (table, key) = self
             .update_target
-            .clone()
+            .as_ref()
+            .and_then(|(table, keys, _)| Some((table.clone(), keys.first()?.clone())))
             .ok_or((false, "No item selected".to_string()))?;
         let mut ph = Placeholders::default();
         let update = ph
@@ -2386,6 +2438,22 @@ impl App {
             values: ph.values,
             summary,
         })
+    }
+
+    /// How many items the open update form applies to.
+    pub fn update_count(&self) -> usize {
+        self.update_target
+            .as_ref()
+            .map_or(0, |(_, keys, _)| keys.len())
+    }
+
+    fn update_many(&mut self, req: ddb::UpdateRequest, keys: Vec<Item>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.screen = self.update_return;
+        self.progress(format!("Updating {} items…", keys.len()));
+        self.spawn(async move { Msg::UpdatedMany(ddb::update_items(&client, &req, keys).await) });
     }
 
     fn update(&mut self, req: ddb::UpdateRequest) {
@@ -3432,6 +3500,33 @@ mod tests {
         let labels: Vec<String> = app.palette_entries().into_iter().map(|e| e.label).collect();
         assert_eq!(labels[0], "open table Orders");
         assert!(!labels.iter().any(|l| l.contains("Users")));
+    }
+
+    #[test]
+    fn marked_rows_share_one_update() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rows: Vec<Item> = (0..3)
+            .map(|i| {
+                let mut it = item(&[("pk", "u")]);
+                it.insert("sk".into(), AttributeValue::N(i.to_string()));
+                it
+            })
+            .collect();
+        let mut app = table_app(&rt, rows);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.update_count(), 2);
+        for c in "SET seen = true".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        let Some(Confirm::UpdateMany { req, keys, hidden }) = &app.confirm else {
+            panic!("expected one update for the marked rows")
+        };
+        assert_eq!((keys.len(), *hidden), (2, 0));
+        assert_eq!(req.key, keys[0]);
+        assert_eq!(req.update, "SET #n0 = :v0");
     }
 
     #[test]

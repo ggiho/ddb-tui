@@ -405,7 +405,11 @@ pub(super) fn draw_update(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::raw(""));
     let popup = centered(area, width as u16, lines.len() as u16 + 2);
-    let inner = card(f, popup, "UpdateItem", theme::current().accent);
+    let title = match app.update_count() {
+        n if n > 1 => format!("UpdateItem · {n} marked items"),
+        _ => "UpdateItem".to_string(),
+    };
+    let inner = card(f, popup, &title, theme::current().accent);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -626,6 +630,32 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(hint("  …"));
             }
             ("Run statement", true, lines)
+        }
+        Some(Confirm::UpdateMany { req, keys, hidden }) => {
+            let mut lines = vec![Line::styled(
+                format!(" Update {} items in {}?", keys.len(), req.table),
+                bold,
+            )];
+            for key in keys.iter().take(5) {
+                lines.push(hint(&format!("  {}", item::item_to_plain_json(key))));
+            }
+            if keys.len() > 5 {
+                lines.push(hint(&format!("  … and {} more", keys.len() - 5)));
+            }
+            lines.push(Line::styled(
+                format!("   {}", req.summary),
+                theme::fg(t.text),
+            ));
+            if *hidden > 0 {
+                lines.push(Line::styled(
+                    format!(" {hidden} of the marked items are hidden by the current search."),
+                    theme::fg(t.warn),
+                ));
+            }
+            lines.push(hint(
+                "Each item is updated in turn; one failure does not stop the rest.",
+            ));
+            ("Update", false, lines)
         }
         Some(Confirm::Update(req)) => (
             "Update",
