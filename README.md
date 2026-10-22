@@ -17,8 +17,9 @@ A fast terminal UI for Amazon DynamoDB.
   written in DynamoDB's own expression syntax.
 - Edit items in `$EDITOR`, create, duplicate, delete (one or many) and run UpdateItem
   expressions, all behind a confirmation.
-- PartiQL, table details (keys, indexes, capacity, deletion protection, encryption, TTL,
-  point-in-time recovery, tags), consumed capacity per page and the requests behind it.
+- PartiQL, table details (keys, the attributes seen on the loaded page, indexes, capacity,
+  deletion protection, encryption, TTL, point-in-time recovery, tags), consumed capacity per page
+  and the requests behind it.
 - Search the table list or the loaded page as you type, with matches highlighted.
 - View items as DynamoDB JSON or plain JSON, copy them, export a page to CSV or JSON, switch
   regions.
@@ -80,7 +81,7 @@ ones:
 | Connections | `/` search profile, region or account · `Enter` connect |
 | Tables | `Enter` open (scan) · `/` search · `t` details · `x` PartiQL · `R` region · `o` saved operations |
 | Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` columns |
-| Detail | `v` DynamoDB / plain JSON · `e` edit · `u` update · `c` copy as new · `y`/`Y` copy JSON |
+| Detail | `v` DynamoDB / plain JSON · `e` edit · `u` update · `d` delete · `c` copy as new · `y`/`Y` copy JSON |
 | Forms | `Tab` complete attribute name or next field · `←`/`→` change choice · `Enter` run |
 
 ## Expressions

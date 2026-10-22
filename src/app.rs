@@ -94,6 +94,38 @@ pub enum DetailKind {
     Table,
 }
 
+/// One attribute as seen on the loaded page.
+pub struct AttributeStat {
+    pub name: String,
+    /// DynamoDB type tags (`S`, `N`, `M`, …) in the order first seen; empty when the
+    /// attribute was only seen on another page.
+    pub types: Vec<&'static str>,
+    /// Items of the page that have it.
+    pub present: usize,
+}
+
+pub struct AttributeStats {
+    pub stats: Vec<AttributeStat>,
+    /// Items on the loaded page, for `present`.
+    pub items: usize,
+}
+
+fn type_tag(v: &AttributeValue) -> &'static str {
+    match v {
+        AttributeValue::S(_) => "S",
+        AttributeValue::N(_) => "N",
+        AttributeValue::B(_) => "B",
+        AttributeValue::Bool(_) => "BOOL",
+        AttributeValue::Null(_) => "NULL",
+        AttributeValue::M(_) => "M",
+        AttributeValue::L(_) => "L",
+        AttributeValue::Ss(_) => "SS",
+        AttributeValue::Ns(_) => "NS",
+        AttributeValue::Bs(_) => "BS",
+        _ => "?",
+    }
+}
+
 /// One key binding: what to press, what it does, and the key the command palette sends
 /// (none for movement and other keys that make no sense as a command).
 pub struct Binding {
@@ -152,12 +184,12 @@ const TABLES_SEARCH_KEYS: &[Binding] = &[
     hint("Esc", "clear"),
 ];
 const ITEMS_KEYS: &[Binding] = &[
-    bind("/", "search this page", KeyCode::Char('/')),
+    bind("/", "search", KeyCode::Char('/')),
     bind("f", "filter / query", KeyCode::Char('f')),
-    bind("Enter", "view item", KeyCode::Enter),
+    bind("Enter", "view", KeyCode::Enter),
     bind("e", "edit", KeyCode::Char('e')),
     bind("u", "update", KeyCode::Char('u')),
-    bind("a", "add item", KeyCode::Char('a')),
+    bind("a", "add", KeyCode::Char('a')),
     bind("d", "delete", KeyCode::Char('d')),
     hint("n / p", "next / previous page"),
     bind("space", "mark row", KeyCode::Char(' ')),
@@ -187,6 +219,7 @@ const ITEMS_SEARCH_KEYS: &[Binding] = &[
 const ITEM_DETAIL_KEYS: &[Binding] = &[
     bind("e", "edit", KeyCode::Char('e')),
     bind("u", "update", KeyCode::Char('u')),
+    bind("d", "delete", KeyCode::Char('d')),
     bind("v", "DynamoDB / plain JSON", KeyCode::Char('v')),
     bind("c", "copy as new item", KeyCode::Char('c')),
     bind("y", "copy as DynamoDB JSON", KeyCode::Char('y')),
@@ -495,6 +528,63 @@ impl App {
 
     pub fn selected_item(&self) -> Option<&Item> {
         self.selected_index().and_then(|i| self.items().get(i))
+    }
+
+    /// Attributes of `table` as seen so far: name, types and how many items of the loaded
+    /// page have them. DynamoDB keeps no schema beyond the keys, so this is all there is.
+    /// Key attributes come first, then the most common.
+    pub fn attribute_stats(&self, table: &str) -> AttributeStats {
+        let page = if self.request_table().as_deref() == Some(table) {
+            self.items()
+        } else {
+            &[]
+        };
+        let mut stats: Vec<AttributeStat> = Vec::new();
+        for item in page {
+            for (name, value) in item {
+                let ty = type_tag(value);
+                match stats.iter_mut().find(|s| s.name == *name) {
+                    Some(s) => {
+                        s.present += 1;
+                        if !s.types.contains(&ty) {
+                            s.types.push(ty);
+                        }
+                    }
+                    None => stats.push(AttributeStat {
+                        name: name.clone(),
+                        types: vec![ty],
+                        present: 1,
+                    }),
+                }
+            }
+        }
+        // Names seen on other pages of this table but not on this one.
+        for name in self.seen_attrs.get(table).into_iter().flatten() {
+            if !stats.iter().any(|s| s.name == *name) {
+                stats.push(AttributeStat {
+                    name: name.clone(),
+                    types: Vec::new(),
+                    present: 0,
+                });
+            }
+        }
+        let keys: Vec<String> = self
+            .table_cache
+            .get(table)
+            .map(|t| t.base().keys().map(|k| k.name.clone()).collect())
+            .unwrap_or_default();
+        stats.sort_by(|a, b| {
+            let rank =
+                |s: &AttributeStat| keys.iter().position(|k| *k == s.name).unwrap_or(usize::MAX);
+            rank(a)
+                .cmp(&rank(b))
+                .then(b.present.cmp(&a.present))
+                .then(a.name.cmp(&b.name))
+        });
+        AttributeStats {
+            stats,
+            items: page.len(),
+        }
     }
 
     pub fn cached_table(&self, name: &str) -> Option<&TableInfo> {
@@ -830,6 +920,11 @@ impl App {
             }
             Msg::Deleted(report) => {
                 self.marked.clear();
+                // The item on the detail screen is gone; back to the list.
+                if self.screen == Screen::Detail && self.detail.is_some() && report.deleted > 0 {
+                    self.detail = None;
+                    self.screen = self.detail_return;
+                }
                 if report.failed.is_empty() {
                     self.ok(format!(
                         "Deleted {} item(s){}",
@@ -1418,6 +1513,11 @@ impl App {
                     self.open_update(item, Screen::Detail);
                 }
             }
+            KeyCode::Char('d') => {
+                if let Some(item) = self.detail.clone() {
+                    self.confirm_delete(vec![item], 0);
+                }
+            }
             KeyCode::Char('y') => self.copy(self.detail.clone(), false),
             KeyCode::Char('Y') => self.copy(self.detail.clone(), true),
             KeyCode::Char('v') if self.detail_kind == DetailKind::Item => {
@@ -1856,7 +1956,13 @@ impl App {
     }
 
     fn request_delete(&mut self) {
-        let rows = self.target_rows();
+        let visible = self.visible_rows();
+        let hidden = self.marked.iter().filter(|i| !visible.contains(i)).count();
+        self.confirm_delete(self.target_rows(), hidden);
+    }
+
+    /// Asks before deleting `rows`, of which `hidden` are marked but hidden by the search.
+    fn confirm_delete(&mut self, rows: Vec<Item>, hidden: usize) {
         if rows.is_empty() {
             return;
         }
@@ -1871,8 +1977,6 @@ impl App {
             self.info("Some rows lack the table's key attributes; include them in the projection");
             return;
         };
-        let visible = self.visible_rows();
-        let hidden = self.marked.iter().filter(|i| !visible.contains(i)).count();
         self.confirm = Some(Confirm::Delete {
             table,
             keys,
@@ -2741,6 +2845,54 @@ mod tests {
             Field::Projection,
             "nothing left to complete"
         );
+    }
+
+    #[test]
+    fn deleting_from_the_detail_screen_returns_to_the_list() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut row = item(&[("pk", "a")]);
+        row.insert("sk".into(), AttributeValue::N("1".into()));
+        let mut app = table_app(&rt, vec![row]);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(&app.confirm, Some(Confirm::Delete { keys, .. }) if keys.len() == 1));
+        app.confirm = None;
+        app.on_msg(Msg::Deleted(DeleteReport {
+            requested: 1,
+            deleted: 1,
+            failed: Vec::new(),
+            consumed: None,
+        }));
+        assert_eq!(app.screen, Screen::Items);
+    }
+
+    #[test]
+    fn attribute_stats_count_the_loaded_page_keys_first() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut a = item(&[("pk", "a"), ("name", "x")]);
+        a.insert("score".into(), AttributeValue::N("1".into()));
+        let b = item(&[("pk", "b"), ("score", "high")]);
+        let mut app = table_app(&rt, vec![a, b]);
+        app.table_cache.insert("t".into(), table());
+        app.seen_attrs
+            .insert("t".into(), ["old".to_string()].into());
+        let stats = app.attribute_stats("t");
+        let rows: Vec<(&str, Vec<&str>, usize)> = stats
+            .stats
+            .iter()
+            .map(|s| (s.name.as_str(), s.types.clone(), s.present))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("pk", vec!["S"], 2),
+                ("score", vec!["N", "S"], 2),
+                ("name", vec!["S"], 1),
+                ("old", vec![], 0),
+            ]
+        );
+        assert_eq!(stats.items, 2);
+        assert!(app.attribute_stats("other").stats.is_empty());
     }
 
     #[test]

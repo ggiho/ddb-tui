@@ -6,12 +6,13 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::fit;
+use crate::app::AttributeStats;
 use crate::details::{IndexDetails, KeyPart, Setting, State, TableDetails, bytes};
 use crate::{app, theme};
 
 const LABEL_W: usize = 24;
 
-pub(super) fn lines(d: &TableDetails, width: usize) -> Vec<Line<'static>> {
+pub(super) fn lines(d: &TableDetails, attrs: &AttributeStats, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     tiles(&mut out, d, width);
 
@@ -21,6 +22,9 @@ pub(super) fn lines(d: &TableDetails, width: usize) -> Vec<Line<'static>> {
     for k in &d.keys {
         out.push(key_line(k, name_w));
     }
+
+    out.push(Line::raw(""));
+    attributes(&mut out, attrs, width);
 
     out.push(Line::raw(""));
     settings(&mut out, d, width);
@@ -198,6 +202,83 @@ fn key_line(k: &KeyPart, name_w: usize) -> Line<'static> {
         Span::styled(pad(&k.name, name_w), theme::bold(t.text)),
         Span::styled(format!("   {} · {ty}", k.ty), theme::muted()),
     ])
+}
+
+/// The attributes seen on the loaded page with their types and how often they appear, as a
+/// short bar. DynamoDB has no schema beyond the keys, so this is what the data shows.
+fn attributes(out: &mut Vec<Line<'static>>, attrs: &AttributeStats, width: usize) {
+    const SHOWN: usize = 30;
+    const BAR: usize = 10;
+    let t = theme::current();
+    let mut title = section("ATTRIBUTES", Some(attrs.stats.len())).spans;
+    if attrs.items > 0 {
+        title.push(Span::styled(
+            format!("  ·  on the loaded page of {} items", attrs.items),
+            theme::muted(),
+        ));
+    }
+    out.push(Line::from(title));
+    if attrs.stats.is_empty() {
+        out.push(Line::styled(
+            "   Open the table to see its attributes; only the keys are fixed",
+            theme::muted(),
+        ));
+        return;
+    }
+    let name_w = attrs
+        .stats
+        .iter()
+        .map(|s| s.name.width())
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 32);
+    let types: Vec<String> = attrs.stats.iter().map(|s| s.types.join(" · ")).collect();
+    let type_w = types
+        .iter()
+        .map(|t| t.width())
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 16);
+    out.push(Line::from(vec![
+        Span::styled(
+            format!("   {}{}", pad("NAME", name_w + 3), pad("TYPE", type_w + 3)),
+            theme::bold(t.muted),
+        ),
+        Span::styled("PRESENT", theme::bold(t.muted)),
+    ]));
+    for (s, ty) in attrs.stats.iter().zip(&types).take(SHOWN) {
+        let mut spans = vec![
+            Span::styled(
+                format!("   {}", pad(&s.name, name_w + 3)),
+                theme::fg(t.text),
+            ),
+            Span::styled(
+                pad(if ty.is_empty() { "—" } else { ty }, type_w + 3),
+                theme::fg(t.subtext),
+            ),
+        ];
+        if s.present == 0 || attrs.items == 0 {
+            spans.push(Span::styled("seen on another page", theme::muted()));
+        } else {
+            let filled = (s.present * BAR).div_ceil(attrs.items).min(BAR);
+            spans.push(Span::styled("━".repeat(filled), theme::fg(t.accent)));
+            spans.push(Span::styled("━".repeat(BAR - filled), theme::fg(t.border)));
+            let pct = s.present * 100 / attrs.items;
+            spans.push(Span::styled(format!("  {pct:>3}%"), theme::fg(t.subtext)));
+        }
+        let line = Line::from(spans);
+        out.push(if super::width_of(&line.spans) > width {
+            Line::from(line.spans.into_iter().take(2).collect::<Vec<_>>())
+        } else {
+            line
+        });
+    }
+    if attrs.stats.len() > SHOWN {
+        out.push(Line::styled(
+            format!("   … and {} more", attrs.stats.len() - SHOWN),
+            theme::muted(),
+        ));
+    }
 }
 
 fn setting_line(s: &Setting, width: usize) -> Vec<Span<'static>> {

@@ -737,7 +737,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         DetailKind::Table => app
             .details
             .as_ref()
-            .map(|d| details::lines(d, width))
+            .map(|d| details::lines(d, &app.attribute_stats(&d.name), width))
             .unwrap_or_default(),
     };
     let height = area.height.saturating_sub(2) as usize;
