@@ -59,6 +59,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.palette.is_some() {
         popups::draw_palette(f, app, body);
     }
+    if app.export_job.is_some() {
+        popups::draw_export(f, app, body);
+    }
     if app.show_help {
         popups::draw_help(f, app, body);
     }
@@ -442,6 +445,7 @@ mod tests {
                 global: false,
             }],
             item_count: Some(3),
+            size_bytes: Some(4096),
         });
         app.request = Some(ReadRequest::scan("Demo"));
         let rows: Vec<Item> = (0..3)

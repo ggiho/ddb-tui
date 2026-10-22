@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, 
 use unicode_width::UnicodeWidthStr;
 
 use super::{centered, clear_popup, fit};
-use crate::app::{App, Confirm};
+use crate::app::{App, Confirm, PromptAction};
 use crate::ddb::{self, SkOp};
 use crate::form::Field;
 use crate::{highlight, item, theme};
@@ -585,6 +585,15 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
             }
             ("Delete", true, lines)
         }
+        Some(Confirm::ExportAll { path }) => (
+            "Export all results",
+            false,
+            vec![
+                Line::styled(format!(" Read the whole result into {path}?"), bold),
+                Line::styled(format!("   {}", app.read_all_estimate()), theme::fg(t.text)),
+                hint("Pages are written as they arrive; Esc stops and removes the file."),
+            ],
+        ),
         Some(Confirm::AllowWrites) => (
             "Allow writes",
             true,
@@ -670,14 +679,60 @@ pub(super) fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
         true,
         width.saturating_sub(5),
     ));
-    let lines = vec![
-        Line::raw(""),
-        Line::from(input),
-        Line::raw(""),
-        hint("Enter writes (never overwrites)   Esc cancels"),
-    ];
+    let mut lines = vec![Line::raw(""), Line::from(input), Line::raw("")];
+    if p.action == PromptAction::Export {
+        let mut scope = vec![Span::raw(" ")];
+        scope.extend(choice(
+            &[&format!("this {}", p.scope), "all results"],
+            usize::from(p.all),
+            true,
+        ));
+        scope.push(Span::styled("  Tab switches", theme::muted()));
+        lines.push(Line::from(scope));
+        lines.push(Line::raw(""));
+    }
+    lines.push(hint("Enter writes (never overwrites)   Esc cancels"));
     let popup = centered(area, width as u16, lines.len() as u16 + 2);
     let inner = card(f, popup, p.title.trim(), theme::current().accent);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The whole-result export while it runs.
+pub(super) fn draw_export(f: &mut Frame, app: &App, area: Rect) {
+    let Some(job) = &app.export_job else { return };
+    let t = theme::current();
+    let p = job.progress;
+    let secs = job.started.elapsed().as_secs();
+    let lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(format!(" {} ", super::spinner()), theme::accent()),
+            Span::styled("Reading every page into ", theme::fg(t.text)),
+            Span::styled(job.path.clone(), theme::bold(t.text)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(format!("   {} items", p.items), theme::bold(t.number)),
+            Span::styled(
+                format!(
+                    "   ·   {} {}",
+                    p.pages,
+                    if p.pages == 1 { "page" } else { "pages" }
+                ),
+                theme::fg(t.subtext),
+            ),
+            Span::styled(format!("   ·   {} RCU", p.consumed), theme::fg(t.subtext)),
+            Span::styled(
+                format!("   ·   {}:{:02}", secs / 60, secs % 60),
+                theme::fg(t.subtext),
+            ),
+        ]),
+        Line::raw(""),
+        hint("Esc cancels and removes the partial file"),
+    ];
+    let width = area.width.saturating_sub(4).min(76);
+    let popup = centered(area, width, lines.len() as u16 + 2);
+    let inner = card(f, popup, "Exporting", t.accent);
     f.render_widget(Paragraph::new(lines), inner);
 }
 

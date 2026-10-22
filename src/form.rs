@@ -276,6 +276,7 @@ mod tests {
                 },
             ],
             item_count: None,
+            size_bytes: None,
         }
     }
 

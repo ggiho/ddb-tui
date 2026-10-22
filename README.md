@@ -21,8 +21,9 @@ A fast terminal UI for Amazon DynamoDB.
   deletion protection, encryption, TTL, point-in-time recovery, tags), consumed capacity per page
   and the requests behind it.
 - Search the table list or the loaded page as you type, with matches highlighted.
-- View items as DynamoDB JSON or plain JSON, copy them, export a page to CSV or JSON, switch
-  regions.
+- View items as DynamoDB JSON or plain JSON, copy them, and export a page or the whole result
+  to CSV, JSON or JSON Lines. A whole-result export streams to the file page by page, shows its
+  progress and cost, and can be cancelled; switch regions.
 - Reads and writes [NoSQL Workbench](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/workbench.html)
   saved operations, so the two tools share them.
 
@@ -80,6 +81,7 @@ ones:
 | Anywhere | `Ctrl+P` command palette · `T` theme · `W` allow or block writes · `?` keys |
 | Connections | `/` search profile, region or account · `Enter` connect |
 | Tables | `Enter` open (scan) · `/` search · `t` details · `x` PartiQL · `R` region · `o` saved operations |
+| Export (`E`) | `Tab` this page / all results · `Enter` write · `Esc` cancel (also stops a running export) |
 | Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` columns |
 | Detail | `v` DynamoDB / plain JSON · `e` edit · `u` update · `d` delete · `c` copy as new · `y`/`Y` copy JSON |
 | Forms | `Tab` complete attribute name or next field · `←`/`→` change choice · `Enter` run |

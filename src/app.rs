@@ -4,6 +4,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
@@ -68,6 +70,9 @@ pub enum Msg {
     Details(anyhow::Result<details::TableDetails>),
     /// The updated item (ReturnValues ALL_NEW) and the write capacity used.
     Updated(anyhow::Result<(Option<Item>, Option<f64>)>),
+    /// How far a whole-result export has come; not a reply, so it does not end a request.
+    ExportProgress(export::Progress),
+    Exported(anyhow::Result<export::Summary>),
     /// The full item fetched for the editor, or `None` if it no longer exists.
     Loaded {
         kind: EditKind,
@@ -254,6 +259,12 @@ const LIST_POPUP_KEYS: &[Binding] = &[
     hint("Esc", "back"),
 ];
 const PROMPT_KEYS: &[Binding] = &[hint("Enter", "write"), hint("Esc", "cancel")];
+const EXPORT_PROMPT_KEYS: &[Binding] = &[
+    hint("Enter", "write"),
+    hint("Tab", "this page / all results"),
+    hint("Esc", "cancel"),
+];
+const EXPORT_KEYS: &[Binding] = &[hint("Esc", "cancel the export")];
 const CONFIRM_KEYS: &[Binding] = &[hint("y", "yes"), hint("n / Esc", "cancel")];
 const PALETTE_KEYS: &[Binding] = &[
     hint("type", "filter"),
@@ -311,6 +322,10 @@ pub enum Confirm {
     Statement(String),
     /// Lift read-only mode for the rest of the session.
     AllowWrites,
+    /// Read the whole result and write it to `path`.
+    ExportAll {
+        path: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +339,18 @@ pub struct Prompt {
     pub title: String,
     pub text: String,
     pub action: PromptAction,
+    /// Export only: write the whole result instead of this page; Tab switches.
+    pub all: bool,
+    /// Export only: what "this page" covers, such as "page 2 (50 items)".
+    pub scope: String,
+}
+
+/// A whole-result export in progress; Esc sets `cancel`.
+pub struct ExportJob {
+    pub path: String,
+    pub progress: export::Progress,
+    pub started: Instant,
+    cancel: Arc<AtomicBool>,
 }
 
 /// The UpdateItem popup. Texts are kept between uses, so one update can be applied to
@@ -392,6 +419,7 @@ pub struct App {
     pub saved_state: ListState,
     pub show_help: bool,
     pub palette: Option<Palette>,
+    pub export_job: Option<ExportJob>,
     pub status: Status,
     status_at: Instant,
     /// Requests in flight; drives the loading indicator.
@@ -469,6 +497,7 @@ impl App {
             saved_state: ListState::default(),
             show_help: false,
             palette: None,
+            export_job: None,
             status: Status::Info(String::new()),
             status_at: Instant::now(),
             busy: 0,
@@ -593,8 +622,16 @@ impl App {
 
     /// The keys that apply right now, for the footer and the key list.
     pub fn bindings(&self) -> &'static [Binding] {
-        if self.palette.is_some() {
+        if self.export_job.is_some() {
+            EXPORT_KEYS
+        } else if self.palette.is_some() {
             PALETTE_KEYS
+        } else if self
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.action == PromptAction::Export)
+        {
+            EXPORT_PROMPT_KEYS
         } else if self.prompt.is_some() {
             PROMPT_KEYS
         } else if self.confirm.is_some() {
@@ -628,6 +665,7 @@ impl App {
     pub fn palette_allowed(&self) -> bool {
         self.prompt.is_none()
             && self.confirm.is_none()
+            && self.export_job.is_none()
             && matches!(
                 self.screen,
                 Screen::Connections | Screen::Tables | Screen::Items | Screen::Detail
@@ -833,8 +871,31 @@ impl App {
     }
 
     pub fn on_msg(&mut self, msg: Msg) {
-        self.busy = self.busy.saturating_sub(1);
+        if !matches!(msg, Msg::ExportProgress(_)) {
+            self.busy = self.busy.saturating_sub(1);
+        }
         match msg {
+            Msg::ExportProgress(p) => {
+                if let Some(job) = &mut self.export_job {
+                    job.progress = p;
+                }
+            }
+            Msg::Exported(result) => {
+                let job = self.export_job.take();
+                let (path, secs) = job
+                    .map(|j| (j.path, j.started.elapsed().as_secs()))
+                    .unwrap_or_default();
+                match result {
+                    Ok(s) if s.cancelled => {
+                        self.info("Export cancelled; the partial file was removed")
+                    }
+                    Ok(s) => self.ok(format!(
+                        "Exported {} items to {path} · {} RCU · {secs} s",
+                        s.progress.items, s.progress.consumed
+                    )),
+                    Err(e) => self.error(format!("Export failed, nothing kept: {e:#}")),
+                }
+            }
             Msg::Connected {
                 conn,
                 client,
@@ -988,6 +1049,14 @@ impl App {
         }
         if self.show_help {
             self.show_help = false;
+            return;
+        }
+        // An export runs until it ends or Esc cancels it; other keys wait.
+        if let Some(job) = &self.export_job {
+            if key.code == KeyCode::Esc {
+                job.cancel.store(true, Ordering::Relaxed);
+                self.progress("Cancelling the export…");
+            }
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
@@ -1150,6 +1219,7 @@ impl App {
                 Some(Confirm::Delete { table, keys, .. }) => self.delete(table, keys),
                 Some(Confirm::Update(req)) => self.update(req),
                 Some(Confirm::Statement(statement)) => self.run_statement(statement),
+                Some(Confirm::ExportAll { path }) => self.export_all(path),
                 Some(Confirm::AllowWrites) => {
                     self.writes_allowed = true;
                     self.ok("Writes allowed for this session · W turns them off");
@@ -1173,11 +1243,13 @@ impl App {
                 self.prompt = None;
                 self.info("Cancelled");
             }
+            KeyCode::Tab if prompt.action == PromptAction::Export => prompt.all = !prompt.all,
             KeyCode::Enter => {
                 let text = prompt.text.trim().to_string();
-                let action = prompt.action;
+                let (action, all) = (prompt.action, prompt.all);
                 self.prompt = None;
                 match action {
+                    PromptAction::Export if all => self.confirm_export_all(text),
                     PromptAction::Export => self.export(&text),
                     PromptAction::SaveOperation => self.save_operation(&text),
                 }
@@ -2054,9 +2126,98 @@ impl App {
             format!("{n} marked items")
         };
         self.prompt = Some(Prompt {
-            title: format!(" Export {what} · .csv or .json "),
+            title: " Export · .csv, .json or .jsonl ".into(),
             text: format!("{name}-{secs}.csv"),
             action: PromptAction::Export,
+            all: false,
+            scope: what,
+        });
+    }
+
+    fn confirm_export_all(&mut self, path: String) {
+        match &self.request {
+            None => return,
+            Some(r) if r.is_write() => {
+                self.info("A write statement has no results to export");
+                return;
+            }
+            Some(_) => {}
+        }
+        if let Err(e) = export::check_name(Path::new(&path)) {
+            self.error(e);
+            return;
+        }
+        self.confirm = Some(Confirm::ExportAll { path });
+    }
+
+    /// Roughly what reading the whole result costs, for the export confirmation.
+    pub fn read_all_estimate(&self) -> String {
+        match &self.request {
+            Some(ReadRequest::Scan {
+                table,
+                index: None,
+                opts,
+            }) => {
+                let size = self
+                    .table_cache
+                    .get(table)
+                    .or(self.table.as_ref())
+                    .and_then(|t| t.size_bytes);
+                match size {
+                    Some(bytes) => {
+                        // A read unit covers 4 KB, half a unit when eventually consistent.
+                        let units = ((bytes as f64 / 4096.0).ceil()
+                            * if opts.consistent { 1.0 } else { 0.5 })
+                        .ceil();
+                        format!(
+                            "A full scan of {table} ({}): about {units} RCU",
+                            details::bytes(bytes)
+                        )
+                    }
+                    None => format!("A full scan of {table}"),
+                }
+            }
+            Some(ReadRequest::Scan {
+                table,
+                index: Some(index),
+                ..
+            }) => format!("A full scan of index {index} on {table}"),
+            Some(ReadRequest::Query { .. }) => "Reads every item the key condition matches".into(),
+            Some(ReadRequest::PartiQL { .. }) => "Reads every item the statement selects".into(),
+            None => String::new(),
+        }
+    }
+
+    /// Reads every page of the current read into `path` in the background.
+    fn export_all(&mut self, path: String) {
+        let (Some(client), Some(req)) = (self.client.clone(), self.request.clone()) else {
+            return;
+        };
+        let (cols, keys) = self.columns();
+        let key_columns = cols[..keys].to_vec();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.export_job = Some(ExportJob {
+            path: path.clone(),
+            progress: export::Progress::default(),
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        self.busy += 1;
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let progress_tx = tx.clone();
+            let result = export::export_all(
+                &client,
+                &req,
+                Path::new(&path),
+                &key_columns,
+                &cancel,
+                move |p| {
+                    let _ = progress_tx.send(Msg::ExportProgress(p));
+                },
+            )
+            .await;
+            let _ = tx.send(Msg::Exported(result));
         });
     }
 
@@ -2273,6 +2434,8 @@ impl App {
             title: " Save this read as (Workbench saved operation) ".into(),
             text: String::new(),
             action: PromptAction::SaveOperation,
+            all: false,
+            scope: String::new(),
         });
     }
 
@@ -2472,6 +2635,7 @@ mod tests {
                 },
             ],
             item_count: None,
+            size_bytes: None,
         }
     }
 
@@ -2704,6 +2868,25 @@ mod tests {
         assert_eq!(app.partiql, "SELECT * FROM \"t\" WHERE pk = 'a'");
         assert_eq!(app.screen, Screen::PartiQL, "nothing was executed");
         assert!(app.request.is_none());
+    }
+
+    #[test]
+    fn exporting_all_results_asks_first_with_an_estimate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = table_app(&rt, vec![item(&[("pk", "a")])]);
+        app.table.as_mut().unwrap().size_bytes = Some(40_960);
+        press(&mut app, KeyCode::Char('E'));
+        press(&mut app, KeyCode::Tab);
+        assert!(app.prompt.as_ref().unwrap().all, "Tab chose all results");
+        let path = std::env::temp_dir().join(format!("ddb-tui-all-{}.csv", std::process::id()));
+        app.prompt.as_mut().unwrap().text = path.display().to_string();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.confirm, Some(Confirm::ExportAll { .. })));
+        assert_eq!(
+            app.read_all_estimate(),
+            "A full scan of t (41.0 KB): about 5 RCU"
+        );
+        assert!(!path.exists(), "nothing written before the confirmation");
     }
 
     #[test]

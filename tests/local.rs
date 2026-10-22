@@ -216,6 +216,7 @@ async fn checks(client: &Client, table: &str) -> Result<()> {
     );
 
     form_reads(client, table, &info, &item).await?;
+    export_everything(client, table).await?;
     writes_and_capacity(client, table, &item).await?;
     table_details(client, table).await?;
     updates_and_saved_reads(client, table, &info).await
@@ -335,6 +336,48 @@ async fn table_details(client: &Client, table: &str) -> Result<()> {
 }
 
 /// Conditional creates, bulk deletes, consumed capacity and the per-call log.
+/// The whole-result export reads every page and writes each item once; a cancel keeps nothing.
+async fn export_everything(client: &Client, table: &str) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = std::env::temp_dir().join(format!("ddb_tui_it_export_{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let scan = ReadRequest::scan(table);
+    let keys = ["pk".to_string(), "sk".to_string()];
+    let never = Arc::new(AtomicBool::new(false));
+
+    let path = dir.join("all.jsonl");
+    let summary = ddb_tui::export::export_all(client, &scan, &path, &keys, &never, |_| {}).await?;
+    assert!(!summary.cancelled);
+    assert_eq!(summary.progress.items, ITEMS);
+    let lines = std::fs::read_to_string(&path)?;
+    let sks: HashSet<String> = lines
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).map(|v| v["sk"]["N"].to_string()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(sks.len(), ITEMS, "every item once");
+
+    let csv = dir.join("all.csv");
+    ddb_tui::export::export_all(client, &scan, &csv, &keys, &never, |_| {}).await?;
+    let text = std::fs::read_to_string(&csv)?;
+    assert!(
+        text.starts_with("pk,sk,meta,"),
+        "keys first: {}",
+        &text[..40]
+    );
+    assert_eq!(text.lines().count(), ITEMS + 1);
+
+    // The 120 items fit in one request, so the cancel is set before the first page.
+    let stop = Arc::new(AtomicBool::new(false));
+    stop.store(true, Ordering::Relaxed);
+    let cancelled = dir.join("cancelled.json");
+    let summary =
+        ddb_tui::export::export_all(client, &scan, &cancelled, &keys, &stop, |_| {}).await?;
+    assert!(summary.cancelled && !cancelled.exists(), "nothing kept");
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
 async fn writes_and_capacity(client: &Client, table: &str, existing: &Item) -> Result<()> {
     // Creating over an existing key is refused instead of silently replacing the item.
     let err = ddb::put_item(client, table, existing.clone(), Some("pk"))

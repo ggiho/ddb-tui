@@ -164,6 +164,8 @@ pub struct TableInfo {
     /// The table's own key schema first, then GSIs and LSIs.
     pub indexes: Vec<Index>,
     pub item_count: Option<i64>,
+    /// Table size in bytes, refreshed by DynamoDB about every six hours.
+    pub size_bytes: Option<i64>,
 }
 
 impl TableInfo {
@@ -229,6 +231,7 @@ pub async fn describe(client: &Client, table: &str) -> Result<TableInfo> {
         name: table.to_string(),
         indexes,
         item_count: t.item_count(),
+        size_bytes: t.table_size_bytes(),
     })
 }
 
