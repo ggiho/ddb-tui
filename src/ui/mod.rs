@@ -60,8 +60,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.palette.is_some() {
         popups::draw_palette(f, app, body);
     }
-    if app.export_job.is_some() {
-        popups::draw_export(f, app, body);
+    if app.job.is_some() {
+        popups::draw_job(f, app, body);
+    }
+    if app.batch_result.is_some() {
+        popups::draw_batch_result(f, app, body);
     }
     if app.show_help {
         popups::draw_help(f, app, body);
@@ -409,13 +412,16 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Confirm, DetailKind, Palette};
+    use crate::app::{Click, Confirm, DetailKind, Palette};
     use crate::ddb::{Connection, Cursor, Index, Key, Page, ReadRequest, TableInfo};
     use crate::details::{IndexDetails, KeyPart, Setting, State, TableDetails};
     use crate::item::Item;
     use aws_sdk_dynamodb::types::AttributeValue;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{
+        KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     fn sample_app(rt: &tokio::runtime::Runtime) -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -596,6 +602,121 @@ mod tests {
                 .unwrap()
                 .contains("● PROD")
         );
+    }
+
+    fn press_at(app: &mut App, x: u16, y: u16, modifiers: KeyModifiers, kind: MouseEventKind) {
+        app.on_mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers,
+        });
+    }
+
+    fn click_at(app: &mut App, r: Rect) {
+        press_at(
+            app,
+            r.x,
+            r.y,
+            KeyModifiers::NONE,
+            MouseEventKind::Down(MouseButton::Left),
+        );
+    }
+
+    fn spot(app: &App, click: Click) -> Rect {
+        app.hit
+            .buttons
+            .iter()
+            .find(|(_, c)| *c == click)
+            .map(|(r, _)| *r)
+            .unwrap_or_else(|| panic!("no {click:?} in {:?}", app.hit.buttons))
+    }
+
+    #[test]
+    fn clicking_a_cell_moves_the_cell_cursor() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = sample_app(&rt);
+        app.screen = Screen::Items;
+        render(&mut app, 150, 30);
+        let &(x, _, col) = app.hit.columns.last().unwrap();
+        let y = app.hit.rows.y + 1;
+        click_at(&mut app, Rect::new(x, y, 1, 1));
+        assert_eq!((app.col_cursor, app.item_state.selected()), (col, Some(1)));
+        render(&mut app, 150, 30);
+        press_at(
+            &mut app,
+            x,
+            y,
+            KeyModifiers::SHIFT,
+            MouseEventKind::ScrollUp,
+        );
+        assert_eq!(
+            app.col_cursor,
+            col - 1,
+            "Shift and the wheel move between cells"
+        );
+    }
+
+    #[test]
+    fn popups_take_clicks_on_their_buttons_rows_and_options() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = sample_app(&rt);
+        app.screen = Screen::Items;
+
+        app.confirm = Some(Confirm::Delete {
+            table: "Demo".into(),
+            keys: app.items().to_vec(),
+            hidden: 0,
+        });
+        render(&mut app, 120, 34);
+        let cancel = spot(&app, Click::Key(KeyCode::Char('n')));
+        click_at(&mut app, cancel);
+        assert!(app.confirm.is_none(), "the cancel button");
+
+        app.confirm = Some(Confirm::AllowWrites);
+        render(&mut app, 120, 34);
+        click_at(&mut app, Rect::new(0, 33, 1, 1));
+        assert!(app.confirm.is_none(), "a click outside cancels");
+
+        app.screen = Screen::Form;
+        render(&mut app, 120, 34);
+        let scan = spot(&app, Click::FormChoice(crate::form::Field::Mode, 1));
+        click_at(&mut app, scan);
+        assert!(!app.form.query, "the Scan tab");
+        render(&mut app, 120, 34);
+        let next_index = spot(&app, Click::FormStep(crate::form::Field::Index, 1));
+        click_at(&mut app, next_index);
+        assert_eq!(
+            app.form.active(app.table.as_ref().unwrap()),
+            crate::form::Field::Index
+        );
+
+        app.screen = Screen::Items;
+        app.palette = Some(Palette::default());
+        render(&mut app, 120, 34);
+        let first = spot(&app, Click::Palette(0));
+        click_at(&mut app, first);
+        assert!(app.palette.is_none(), "the entry ran");
+    }
+
+    #[test]
+    fn form_arrows_are_clickable_where_they_are_drawn() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = sample_app(&rt);
+        if let Some(sk) = &mut app.table.as_mut().unwrap().indexes[0].sk {
+            sk.name = "order_created_timestamp".into();
+        }
+        app.screen = Screen::Form;
+        let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        for (step, arrow) in [(-1, "◀"), (1, "▶")] {
+            let r = spot(&app, Click::FormStep(crate::form::Field::Op, step));
+            assert!(
+                (r.x..r.x + r.width).any(|x| buf[(x, r.y)].symbol() == arrow),
+                "{arrow} past a long key name"
+            );
+        }
     }
 
     #[test]

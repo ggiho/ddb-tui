@@ -573,6 +573,18 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     }
     let (start, visible) = window(app.col_offset);
     let marker = usize::from(marking);
+    // Where the table puts each column: after the one-cell selection mark and the marker
+    // column, separated by the column gap.
+    let mut x = body.x + 1 + if marking { 1 + COL_GAP } else { 0 };
+    app.hit.columns = visible
+        .iter()
+        .map(|&c| {
+            let w = widths[c] as u16;
+            let spot = (x, w, c);
+            x += w + COL_GAP;
+            spot
+        })
+        .collect();
     app.item_state.select_column(
         visible
             .iter()
@@ -723,43 +735,59 @@ fn draw_pager(f: &mut Frame, app: &App, area: Rect, columns: Option<(usize, usiz
 
 // ---------------------------------------------------------------- preview and detail
 
-fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
     let t = theme::current();
-    let inner = pane(
-        f,
-        area,
-        vec![label("ITEM", false)],
-        vec![
-            Span::styled("Enter", theme::bold(t.accent)),
-            Span::styled(" open", theme::muted()),
-        ],
-        false,
-    );
+    let height = area.height.saturating_sub(2) as usize;
+    let lines = match app.selected_item() {
+        Some(item) => {
+            let (cols, keys) = app.columns();
+            cells::preview_lines(
+                item,
+                &cols[..keys],
+                area.width.saturating_sub(2) as usize,
+                &app.find,
+            )
+        }
+        None => Vec::new(),
+    };
+    // A new row starts at the top; the wheel scrolls within it.
+    if app.preview_row != app.item_state.selected() {
+        app.preview_row = app.item_state.selected();
+        app.preview_scroll = 0;
+    }
+    app.preview_scroll = app
+        .preview_scroll
+        .min(lines.len().saturating_sub(height) as u16);
+    let mut right = Vec::new();
+    if lines.len() > height {
+        let first = app.preview_scroll as usize + 1;
+        right.push(Span::styled(
+            format!(
+                "{first}–{} of {}   ",
+                (first + height - 1).min(lines.len()),
+                lines.len()
+            ),
+            theme::muted(),
+        ));
+    }
+    right.push(Span::styled("Enter", theme::bold(t.accent)));
+    right.push(Span::styled(" open", theme::muted()));
+    let inner = pane(f, area, vec![label("ITEM", false)], right, false);
     let body = Rect {
         y: inner.y + 1,
         height: inner.height.saturating_sub(1),
         ..inner
     };
-    let Some(item) = app.selected_item() else {
+    app.hit.preview = body;
+    if lines.is_empty() {
         draw_centered(
             f,
             body,
             vec![Line::styled("No item selected", theme::muted())],
         );
         return;
-    };
-    let (cols, keys) = app.columns();
-    let mut lines = cells::preview_lines(item, &cols[..keys], body.width as usize, &app.find);
-    let room = body.height as usize;
-    if lines.len() > room && room > 0 {
-        let hidden = lines.len() - room + 1;
-        lines.truncate(room - 1);
-        lines.push(Line::styled(
-            format!("… {hidden} more lines · Enter opens the item"),
-            theme::muted(),
-        ));
     }
-    f.render_widget(Paragraph::new(lines), body);
+    f.render_widget(Paragraph::new(lines).scroll((app.preview_scroll, 0)), body);
 }
 
 fn draw_detail(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {

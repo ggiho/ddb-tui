@@ -299,24 +299,66 @@ async fn updates_and_saved_reads(
         })
         .into();
     let once = update("SET batch = 1", Some("attribute_not_exists(batch)"))?;
-    let first = ddb::update_items(client, &once, keys.clone()).await;
+    let go = std::sync::atomic::AtomicBool::new(false);
+    let first = ddb::update_items(client, &once, keys.clone(), &go, |_| {}).await;
     assert_eq!(
         (first.updated, first.failed.len()),
         (2, 0),
         "{:?}",
         first.failed
     );
-    let second = ddb::update_items(client, &once, keys).await;
+    let second = ddb::update_items(client, &once, keys.clone(), &go, |_| {}).await;
     assert_eq!(
         (second.updated, second.failed.len()),
         (0, 2),
         "the condition now fails"
     );
     assert!(
-        second.failed[0].contains("condition"),
+        second.failed[0].1.contains("condition"),
         "{}",
-        second.failed[0]
+        second.failed[0].1
     );
+    // Previews read fresh copies, and a key whose item is gone is not created by an update.
+    let gone = Item::from([("pk".to_string(), s("gone#1")), ("sk".to_string(), n(1))]);
+    let fresh = ddb::get_items(client, table, vec![keys[0].clone(), gone.clone()]).await;
+    assert_eq!(
+        fresh[0].1.as_ref().unwrap().as_ref().unwrap()["batch"],
+        n(1)
+    );
+    assert!(matches!(fresh[1].1, Ok(None)));
+    let mut guarded = update("SET batch = 2", Some("attribute_exists(pk)"))?;
+    guarded.key = gone.clone();
+    let missed = ddb::update_items(client, &guarded, vec![gone.clone()], &go, |_| {}).await;
+    assert_eq!(missed.failed.len(), 1);
+    assert!(missed.failed[0].1.contains("no longer exists"));
+    assert!(ddb::get_item(client, table, gone).await?.is_none());
+
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    let none = ddb::update_items(client, &once, keys, &stop, |_| {}).await;
+    assert_eq!(
+        (none.updated, none.skipped.len()),
+        (0, 2),
+        "cancelled before sending"
+    );
+
+    // The keys of every item a filtered scan matches, read across pages.
+    let mut ph = Placeholders::default();
+    let filter = ph.condition("type = \"odd\"")?;
+    let odd = ReadRequest::Scan {
+        table: table.into(),
+        index: None,
+        opts: ddb::ReadOptions {
+            filter: Some(filter),
+            names: ph.names,
+            values: ph.values,
+            ..Default::default()
+        },
+    };
+    let found = ddb::collect_keys(client, &odd, info.base(), &go, |_, _| {})
+        .await?
+        .expect("not cancelled");
+    assert_eq!(found.len(), ITEMS / 2);
+    assert!(found.iter().all(|k| k.len() == 2), "keys only");
     Ok(())
 }
 

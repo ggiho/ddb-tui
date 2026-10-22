@@ -3,6 +3,7 @@
 //! palette.
 
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10,7 +11,9 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, 
 use unicode_width::UnicodeWidthStr;
 
 use super::{centered, clear_popup, fit};
-use crate::app::{App, Confirm, PromptAction};
+use crate::app::{
+    App, Click, Confirm, ItemPreview, JobKind, PromptAction, UpdateField, UpdateScope,
+};
 use crate::ddb::{self, SkOp};
 use crate::form::Field;
 use crate::{highlight, item, theme};
@@ -27,6 +30,65 @@ fn card(f: &mut Frame, area: Rect, title: &str, color: Color) -> Rect {
     let inner = block.inner(area);
     f.render_widget(block, area);
     inner
+}
+
+/// Clickable spots worked out while a popup's lines are built: line, column, width and what a
+/// click does. A width of `u16::MAX` spans the line.
+type Spots = Vec<(usize, u16, u16, Click)>;
+
+/// Makes `spots`, placed inside `inner`, the clickable parts of the topmost popup `popup`.
+fn register(app: &mut App, popup: Rect, inner: Rect, spots: Spots) {
+    app.hit.popup = popup;
+    app.hit.buttons = spots
+        .into_iter()
+        .filter_map(|(line, x, width, click)| {
+            let y = inner.y + u16::try_from(line).ok()?;
+            let x = inner.x.checked_add(x)?;
+            (y < inner.bottom() && x < inner.right()).then(|| {
+                let width = width.min(inner.right() - x);
+                (
+                    Rect {
+                        x,
+                        y,
+                        width,
+                        height: 1,
+                    },
+                    click,
+                )
+            })
+        })
+        .collect();
+}
+
+/// The spots of a `choice` row whose first option starts at column `x`.
+fn choice_spots(line: usize, x: u16, options: &[&str], click: impl Fn(usize) -> Click) -> Spots {
+    let mut x = x;
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let width = o.width() as u16 + 2;
+            let spot = (line, x, width, click(i));
+            x += width + 1;
+            spot
+        })
+        .collect()
+}
+
+/// A row of pill buttons and their spots on `line`.
+fn buttons(line: usize, items: &[(&str, Style, Click)]) -> (Line<'static>, Spots) {
+    let mut spans = vec![Span::raw(" ")];
+    let mut spots = Vec::new();
+    let mut x = 1;
+    for (label, style, click) in items {
+        let text = format!(" {label} ");
+        let width = text.width() as u16;
+        spots.push((line, x, width, *click));
+        spans.push(Span::styled(text, *style));
+        spans.push(Span::raw("   "));
+        x += width + 3;
+    }
+    (Line::from(spans), spots)
 }
 
 // ---------------------------------------------------------------- form pieces
@@ -60,6 +122,12 @@ fn form_row(
     spans.push(Span::raw(" ".repeat(LABEL_W.saturating_sub(used))));
     spans.extend(value);
     Line::from(spans)
+}
+
+/// The column where a form row's value starts: after the marker and the label, which a long
+/// key name can push past `LABEL_W`.
+fn value_col(label: &str, required: bool) -> u16 {
+    (3 + LABEL_W.max(label.width() + if required { 2 } else { 0 })) as u16
 }
 
 /// A text input `width` columns wide: the value with a cursor while focused, a dim example
@@ -173,7 +241,7 @@ fn hint_line(app: &App) -> Option<Line<'static>> {
 
 // ---------------------------------------------------------------- read and update forms
 
-pub(super) fn draw_form(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(t) = &app.table else { return };
     let form = &app.form;
     let idx = form.selected_index(t);
@@ -186,8 +254,13 @@ pub(super) fn draw_form(f: &mut Frame, app: &App, area: Rect) {
             .filter(|(f, _)| *f == field)
             .map(|(_, m)| error_line(m))
     };
+    let sk_label = idx.sk.as_ref().map(|sk| format!("{} ({})", sk.name, sk.ty));
     let mut lines: Vec<Line> = Vec::new();
+    let mut rows: Vec<(usize, Field)> = Vec::new();
     let mut push = |line: Line<'static>, field: Option<Field>| {
+        if let Some(field) = field {
+            rows.push((lines.len(), field));
+        }
         lines.push(line);
         if let Some(e) = field.and_then(error_for) {
             lines.push(e);
@@ -215,7 +288,7 @@ pub(super) fn draw_form(f: &mut Frame, app: &App, area: Rect) {
         theme::muted(),
     ));
     push(Line::raw(""), None);
-    push(Line::from(tabs), None);
+    push(Line::from(tabs), Some(Field::Mode));
     push(Line::raw(""), None);
 
     push(section("SOURCE"), None);
@@ -246,11 +319,11 @@ pub(super) fn draw_form(f: &mut Frame, app: &App, area: Rect) {
             ),
             Some(Field::Pk),
         );
-        if let Some(sk) = &idx.sk {
+        if let Some(label) = &sk_label {
             let op = form.sk_op().map_or("any", |o| o.label());
             push(
                 form_row(
-                    &format!("{} ({})", sk.name, sk.ty),
+                    label,
                     false,
                     active == Field::Op,
                     cycle(op, active == Field::Op),
@@ -328,7 +401,7 @@ pub(super) fn draw_form(f: &mut Frame, app: &App, area: Rect) {
                 active == Field::Consistent,
             ),
         ),
-        None,
+        Some(Field::Consistent),
     );
     if form.query {
         push(
@@ -342,55 +415,123 @@ pub(super) fn draw_form(f: &mut Frame, app: &App, area: Rect) {
                     active == Field::Order,
                 ),
             ),
-            None,
+            Some(Field::Order),
         );
     }
     push(Line::raw(""), None);
 
+    // A click on a row focuses it; on an option or an arrow it also picks that value.
+    let index_name = idx.name.clone().unwrap_or_else(|| "table".into());
+    let op_name = form.sk_op().map_or("any", |o| o.label()).to_string();
+    let mut spots: Spots = Vec::new();
+    for &(line, field) in &rows {
+        spots.push((line, 0, u16::MAX, Click::FormField(field)));
+        let options: &[&str] = match field {
+            Field::Mode => &["Query", "Scan"],
+            Field::Consistent => &["off", "on"],
+            Field::Order => &["ascending", "descending"],
+            _ => &[],
+        };
+        let value_x = match field {
+            Field::Op => value_col(sk_label.as_deref().unwrap_or_default(), false),
+            _ => value_col("", false),
+        };
+        let x = if field == Field::Mode { 3 } else { value_x };
+        spots.extend(choice_spots(line, x, options, |i| {
+            Click::FormChoice(field, i)
+        }));
+        let value = match field {
+            Field::Index => &index_name,
+            Field::Op => &op_name,
+            _ => continue,
+        };
+        spots.push((line, value_x, 2, Click::FormStep(field, -1)));
+        spots.push((
+            line,
+            value_x + 2 + value.width() as u16,
+            2,
+            Click::FormStep(field, 1),
+        ));
+    }
+
+    let title = format!("Read · {}", t.name);
     let popup = centered(area, width as u16, lines.len() as u16 + 2);
-    let inner = card(
-        f,
-        popup,
-        &format!("Read · {}", t.name),
-        theme::current().accent,
-    );
+    let inner = card(f, popup, &title, theme::current().accent);
     f.render_widget(Paragraph::new(lines), inner);
+    register(app, popup, inner, spots);
 }
 
-pub(super) fn draw_update(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_update(f: &mut Frame, app: &mut App, area: Rect) {
     let form = &app.update_form;
     let width = (area.width as usize).saturating_sub(4).min(92);
     let value_w = width.saturating_sub(LABEL_W + 6);
+    let on = |field: UpdateField| form.field == field;
     let mut lines = vec![
         Line::raw(""),
         form_row(
             "Update",
             true,
-            !form.on_condition,
+            on(UpdateField::Update),
             text_input(
                 &form.update,
                 "SET views = views + 1 REMOVE draft",
-                !form.on_condition,
+                on(UpdateField::Update),
                 value_w,
             ),
         ),
     ];
+    let mut spots: Spots = vec![(1, 0, u16::MAX, Click::UpdateField(UpdateField::Update))];
     if let Some((false, m)) = &app.update_error {
         lines.push(error_line(m));
     }
+    spots.push((
+        lines.len(),
+        0,
+        u16::MAX,
+        Click::UpdateField(UpdateField::Condition),
+    ));
     lines.push(form_row(
         "Condition",
         false,
-        form.on_condition,
+        on(UpdateField::Condition),
         text_input(
             &form.condition,
             "optional, e.g. attribute_exists(pk)",
-            form.on_condition,
+            on(UpdateField::Condition),
             value_w,
         ),
     ));
     if let Some((true, m)) = &app.update_error {
         lines.push(error_line(m));
+    }
+    let scopes = app.update_scopes();
+    if scopes.len() > 1 {
+        let labels: Vec<&str> = scopes.iter().map(|(_, l)| l.as_str()).collect();
+        let chosen = scopes
+            .iter()
+            .position(|(s, _)| *s == form.scope)
+            .unwrap_or(0);
+        let line = lines.len();
+        spots.push((line, 0, u16::MAX, Click::UpdateField(UpdateField::Scope)));
+        spots.extend(choice_spots(line, (3 + LABEL_W) as u16, &labels, |i| {
+            Click::UpdateScope(scopes[i].0)
+        }));
+        lines.push(form_row(
+            "Apply to",
+            false,
+            on(UpdateField::Scope),
+            choice(&labels, chosen, on(UpdateField::Scope)),
+        ));
+        if form.scope == UpdateScope::All {
+            lines.push(Line::styled(
+                format!(
+                    "{:w$}Every item the read matches, on all pages; keys are read first.",
+                    "",
+                    w = LABEL_W + 3
+                ),
+                theme::fg(theme::current().warn),
+            ));
+        }
     }
     if let Some(h) = hint_line(app) {
         lines.push(h);
@@ -411,9 +552,68 @@ pub(super) fn draw_update(f: &mut Frame, app: &App, area: Rect) {
     };
     let inner = card(f, popup, &title, theme::current().accent);
     f.render_widget(Paragraph::new(lines), inner);
+    register(app, popup, inner, spots);
 }
 
-pub(super) fn draw_partiql(f: &mut Frame, app: &App, area: Rect) {
+/// "what it would change" lines for the update confirmations: the first few items, read
+/// fresh, with each touched attribute's current and new value.
+fn preview_lines(app: &App, req: &ddb::UpdateRequest) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let mut lines = vec![
+        Line::raw(""),
+        section("PREVIEW  · read just now; DynamoDB checks the condition"),
+    ];
+    let Some(rows) = app.update_preview(req) else {
+        lines.push(hint("  reading the items…"));
+        return lines;
+    };
+    let value = |v: &Option<aws_sdk_dynamodb::types::AttributeValue>| {
+        v.as_ref()
+            .map_or("—".to_string(), |v| fit(&item::text(v), false, 28))
+    };
+    for (key, preview) in rows {
+        lines.push(Line::styled(
+            format!("   {}", item::item_to_plain_json(&key)),
+            theme::fg(t.subtext),
+        ));
+        let changes = match preview {
+            ItemPreview::Changes(changes) => changes,
+            ItemPreview::Gone => {
+                lines.push(Line::styled(
+                    "     no longer exists; it will not be updated",
+                    theme::fg(t.warn),
+                ));
+                continue;
+            }
+            ItemPreview::Unread(e) => {
+                lines.push(hint(&format!("    could not be read: {e}")));
+                continue;
+            }
+        };
+        if changes.is_empty() {
+            lines.push(hint("    not worked out here"));
+        }
+        for c in changes {
+            let (after, style) = match &c.after {
+                Some(Some(v)) => (fit(&item::text(v), false, 28), theme::fg(t.accent)),
+                Some(None) => ("(removed)".to_string(), theme::fg(t.warn)),
+                None => ("?".to_string(), theme::muted()),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("     {:<18}", fit(&c.path, false, 18)),
+                    theme::fg(t.text),
+                ),
+                Span::styled(value(&c.before), theme::muted()),
+                Span::styled("  →  ", theme::muted()),
+                Span::styled(after, style),
+            ]));
+        }
+    }
+    lines
+}
+
+pub(super) fn draw_partiql(f: &mut Frame, app: &mut App, area: Rect) {
     let t = theme::current();
     let width = area.width.saturating_sub(4).min(100);
     let input_width = width.saturating_sub(6);
@@ -459,6 +659,7 @@ pub(super) fn draw_partiql(f: &mut Frame, app: &App, area: Rect) {
         },
     );
     f.render_widget(Paragraph::new(examples), examples_area);
+    register(app, popup, inner, Vec::new());
 }
 
 // ---------------------------------------------------------------- pickers
@@ -482,6 +683,12 @@ pub(super) fn draw_regions(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(theme::selected(true))
         .highlight_symbol(Span::styled("▌ ", theme::fg(t.accent)));
     f.render_stateful_widget(list, inner, &mut app.region_state);
+    let offset = app.region_state.offset();
+    let spots = (0..inner.height as usize)
+        .filter(|row| offset + row < ddb::REGIONS.len())
+        .map(|row| (row, 0, u16::MAX, Click::ListRow(offset + row)))
+        .collect();
+    register(app, popup, inner, spots);
 }
 
 pub(super) fn draw_saved(f: &mut Frame, app: &mut App, area: Rect) {
@@ -525,11 +732,17 @@ pub(super) fn draw_saved(f: &mut Frame, app: &mut App, area: Rect) {
         )),
         note,
     );
+    let offset = app.saved_state.offset();
+    let spots = (0..list_area.height as usize)
+        .filter(|row| offset + row < app.saved.len())
+        .map(|row| (row, 0, u16::MAX, Click::ListRow(offset + row)))
+        .collect();
+    register(app, popup, inner, spots);
 }
 
 // ---------------------------------------------------------------- confirmations and prompts
 
-pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
     let t = theme::current();
     let bold = theme::bold(t.text);
     let (title, danger, mut lines) = match &app.confirm {
@@ -598,6 +811,19 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
                 hint("Pages are written as they arrive; Esc stops and removes the file."),
             ],
         ),
+        Some(Confirm::CollectAll(req)) => (
+            "Update all results",
+            false,
+            vec![
+                Line::styled(
+                    format!(" Read the keys of every result in {} first?", req.table),
+                    bold,
+                ),
+                Line::styled(format!("   {}", app.read_all_estimate()), theme::fg(t.text)),
+                Line::styled(format!("   {}", req.summary), theme::fg(t.text)),
+                hint("Only keys are read. Nothing changes until you type the count next."),
+            ],
+        ),
         Some(Confirm::AllowWrites) => (
             "Allow writes",
             true,
@@ -646,15 +872,17 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
                 format!("   {}", req.summary),
                 theme::fg(t.text),
             ));
+            lines.extend(preview_lines(app, req));
             if *hidden > 0 {
                 lines.push(Line::styled(
                     format!(" {hidden} of the marked items are hidden by the current search."),
                     theme::fg(t.warn),
                 ));
             }
-            lines.push(hint(
-                "Each item is updated in turn; one failure does not stop the rest.",
-            ));
+            lines.push(hint(&format!(
+                "Sent {} at a time; a failure does not stop the rest.",
+                ddb::UPDATE_CONCURRENCY
+            )));
             ("Update", false, lines)
         }
         Some(Confirm::Update(req)) => (
@@ -664,7 +892,10 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
                 Line::styled(format!(" Update this item in {}?", req.table), bold),
                 hint(&format!("  {}", item::item_to_plain_json(&req.key))),
                 Line::styled(format!("   {}", req.summary), theme::fg(t.text)),
-            ],
+            ]
+            .into_iter()
+            .chain(preview_lines(app, req))
+            .collect(),
         ),
         None => return,
     };
@@ -685,22 +916,33 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     } else {
         theme::pill(t.on_accent, t.accent)
     };
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(" y  yes ", yes),
-        Span::raw("   "),
-        Span::styled(" n  cancel ", Style::new().bg(t.select).fg(t.text)),
-    ]));
+    let (row, spots) = buttons(
+        lines.len(),
+        &[
+            ("y  yes", yes, Click::Key(KeyCode::Char('y'))),
+            (
+                "n  cancel",
+                Style::new().bg(t.select).fg(t.text),
+                Click::Key(KeyCode::Char('n')),
+            ),
+        ],
+    );
+    lines.push(row);
     lines.push(Line::raw(""));
     let width = (area.width.saturating_sub(4)).min(84);
     let popup = centered(area, width, lines.len() as u16 + 2);
     let color = if danger { t.err } else { t.accent };
     let inner = card(f, popup, title, color);
     f.render_widget(Paragraph::new(lines), inner);
+    register(app, popup, inner, spots);
 }
 
-pub(super) fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_prompt(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(p) = &app.prompt else { return };
+    if p.action == PromptAction::ConfirmCount {
+        draw_count_prompt(f, app, area);
+        return;
+    }
     let width = (area.width as usize).saturating_sub(4).min(84);
     let mut input = vec![Span::raw(" ")];
     input.extend(text_input(
@@ -710,65 +952,284 @@ pub(super) fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
         width.saturating_sub(5),
     ));
     let mut lines = vec![Line::raw(""), Line::from(input), Line::raw("")];
+    let mut spots: Spots = Vec::new();
     if p.action == PromptAction::Export {
+        let options = [format!("this {}", p.scope), "all results".to_string()];
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
+        spots = choice_spots(lines.len(), 1, &options, |i| Click::ExportScope(i == 1));
         let mut scope = vec![Span::raw(" ")];
-        scope.extend(choice(
-            &[&format!("this {}", p.scope), "all results"],
-            usize::from(p.all),
-            true,
-        ));
+        scope.extend(choice(&options, usize::from(p.all), true));
         scope.push(Span::styled("  Tab switches", theme::muted()));
         lines.push(Line::from(scope));
         lines.push(Line::raw(""));
     }
     lines.push(hint("Enter writes (never overwrites)   Esc cancels"));
+    let title = p.title.trim().to_string();
     let popup = centered(area, width as u16, lines.len() as u16 + 2);
-    let inner = card(f, popup, p.title.trim(), theme::current().accent);
+    let inner = card(f, popup, &title, theme::current().accent);
     f.render_widget(Paragraph::new(lines), inner);
+    register(app, popup, inner, spots);
 }
 
-/// The whole-result export while it runs.
-pub(super) fn draw_export(f: &mut Frame, app: &App, area: Rect) {
-    let Some(job) = &app.export_job else { return };
+/// The last step before an update of all results: the count to type, the update and a preview.
+fn draw_count_prompt(f: &mut Frame, app: &mut App, area: Rect) {
+    let (Some(p), Some((req, keys))) = (&app.prompt, app.pending_update()) else {
+        return;
+    };
     let t = theme::current();
-    let p = job.progress;
+    let width = (area.width as usize).saturating_sub(4).min(92);
+    let count = keys.len();
+    let mut input = vec![Span::raw(" ")];
+    input.extend(text_input(&p.text, &count.to_string(), true, 16));
+    let mut lines = vec![Line::raw("")];
+    if app.on_production() {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            theme::production(" ● PRODUCTION connection "),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::styled(
+        format!(
+            " Update all {count} items the read matches in {}?",
+            req.table
+        ),
+        theme::bold(t.err),
+    ));
+    lines.push(Line::styled(
+        format!("   {}", req.summary),
+        theme::fg(t.text),
+    ));
+    lines.extend(preview_lines(app, req));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!(" Type {count} to confirm "), theme::bold(t.text)),
+        Span::raw(" "),
+    ]));
+    lines.push(Line::from(input));
+    lines.push(Line::raw(""));
+    lines.push(hint(
+        "Enter updates · Esc cancels · nothing has changed yet",
+    ));
+    let popup = centered(area, width as u16, lines.len() as u16 + 2);
+    let inner = card(f, popup, "Update all results", t.err);
+    f.render_widget(Paragraph::new(lines), inner);
+    register(app, popup, inner, Vec::new());
+}
+
+/// The running job: an export, the key search for an update of all results, or an update of
+/// many items, with its counts and a bar when the total is known.
+pub(super) fn draw_job(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(job) = &app.job else { return };
+    let t = theme::current();
     let secs = job.started.elapsed().as_secs();
-    let lines = vec![
+    let clock = Span::styled(
+        format!("   ·   {}:{:02}", secs / 60, secs % 60),
+        theme::fg(t.subtext),
+    );
+    let sep = |text: String| Span::styled(format!("   ·   {text}"), theme::fg(t.subtext));
+    let spin = Span::styled(format!(" {} ", super::spinner()), theme::accent());
+    let (title, what, counts, bar, note) = match &job.kind {
+        JobKind::Export { path, progress: p } => (
+            "Exporting",
+            vec![
+                spin,
+                Span::styled("Reading every page into ", theme::fg(t.text)),
+                Span::styled(path.clone(), theme::bold(t.text)),
+            ],
+            vec![
+                Span::styled(format!("   {} items", p.items), theme::bold(t.number)),
+                sep(format!(
+                    "{} {}",
+                    p.requests,
+                    if p.requests == 1 {
+                        "request"
+                    } else {
+                        "requests"
+                    }
+                )),
+                sep(format!("{} RCU", p.consumed)),
+                clock,
+            ],
+            None,
+            "Esc cancels and removes the partial file",
+        ),
+        JobKind::Collect { found, consumed } => (
+            "Finding the items",
+            vec![
+                spin,
+                Span::styled(
+                    "Reading the keys of every item the read matches",
+                    theme::fg(t.text),
+                ),
+            ],
+            vec![
+                Span::styled(format!("   {found} items"), theme::bold(t.number)),
+                sep(format!("{consumed} RCU")),
+                clock,
+            ],
+            None,
+            "Nothing is updated before you confirm the count · Esc cancels",
+        ),
+        JobKind::Update { progress: p, .. } => (
+            "Updating",
+            vec![
+                spin,
+                Span::styled(format!("Updating {} items", p.total), theme::fg(t.text)),
+            ],
+            vec![
+                Span::styled(
+                    format!("   {} of {} done", p.done, p.total),
+                    theme::bold(t.number),
+                ),
+                Span::styled(
+                    format!("   ·   {} failed", p.failed),
+                    theme::fg(if p.failed > 0 { t.err } else { t.subtext }),
+                ),
+                sep(format!("{} WCU", p.consumed)),
+                clock,
+            ],
+            Some((p.done, p.total)),
+            "Esc stops sending; updates already sent still finish",
+        ),
+    };
+    let width = area.width.saturating_sub(4).min(76);
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(what),
+        Line::raw(""),
+        Line::from(counts),
+    ];
+    if let Some((done, total)) = bar {
+        let room = (width as usize).saturating_sub(8);
+        let filled = (done * room).checked_div(total).unwrap_or(0).min(room);
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled("━".repeat(filled), theme::fg(t.accent)),
+            Span::styled("━".repeat(room - filled), theme::fg(t.border)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(hint(note));
+    lines.push(Line::raw(""));
+    let (row, spots) = buttons(
+        lines.len(),
+        &[(
+            "Esc  cancel",
+            Style::new().bg(t.select).fg(t.text),
+            Click::Key(KeyCode::Esc),
+        )],
+    );
+    lines.push(row);
+    let popup = centered(area, width, lines.len() as u16 + 2);
+    let inner = card(f, popup, title, t.accent);
+    f.render_widget(Paragraph::new(lines), inner);
+    register(app, popup, inner, spots);
+}
+
+/// The outcome of an update of many items: counts, then each item not updated and why.
+pub(super) fn draw_batch_result(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(result) = &app.batch_result else {
+        return;
+    };
+    let t = theme::current();
+    let r = &result.report;
+    let width = area.width.saturating_sub(4).min(100);
+    let mut lines = vec![
         Line::raw(""),
         Line::from(vec![
-            Span::styled(format!(" {} ", super::spinner()), theme::accent()),
-            Span::styled("Reading every page into ", theme::fg(t.text)),
-            Span::styled(job.path.clone(), theme::bold(t.text)),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(format!("   {} items", p.items), theme::bold(t.number)),
+            Span::styled(format!(" ✔ {} updated", r.updated), theme::bold(t.ok)),
+            Span::styled(
+                format!("    ✖ {} failed", r.failed.len()),
+                theme::bold(if r.failed.is_empty() { t.muted } else { t.err }),
+            ),
+            Span::styled(
+                format!("    ◌ {} not sent", r.skipped.len()),
+                theme::bold(if r.skipped.is_empty() {
+                    t.muted
+                } else {
+                    t.warn
+                }),
+            ),
             Span::styled(
                 format!(
-                    "   ·   {} {}",
-                    p.pages,
-                    if p.pages == 1 { "page" } else { "pages" }
+                    "    {} WCU · {}:{:02}",
+                    r.consumed.unwrap_or(0.0),
+                    result.secs / 60,
+                    result.secs % 60
                 ),
                 theme::fg(t.subtext),
             ),
-            Span::styled(format!("   ·   {} RCU", p.consumed), theme::fg(t.subtext)),
+        ]),
+        Line::styled(format!("   {}", result.req.summary), theme::muted()),
+    ];
+    let mut rows: Vec<Line> = Vec::new();
+    for (key, why) in &r.failed {
+        rows.push(Line::from(vec![
+            Span::styled("   ✖ ", theme::fg(t.err)),
             Span::styled(
-                format!("   ·   {}:{:02}", secs / 60, secs % 60),
+                fit(&item::item_to_plain_json(key).to_string(), false, 40),
+                theme::fg(t.text),
+            ),
+            Span::styled(
+                format!("  {}", fit(why, false, (width as usize).saturating_sub(52))),
                 theme::fg(t.subtext),
             ),
-        ]),
-        Line::raw(""),
-        hint("Esc cancels and removes the partial file"),
-    ];
-    let width = area.width.saturating_sub(4).min(76);
+        ]));
+    }
+    for key in &r.skipped {
+        rows.push(Line::from(vec![
+            Span::styled("   ◌ ", theme::fg(t.warn)),
+            Span::styled(
+                fit(&item::item_to_plain_json(key).to_string(), false, 40),
+                theme::fg(t.text),
+            ),
+            Span::styled("  not sent", theme::muted()),
+        ]));
+    }
+    let room = (area.height as usize).saturating_sub(12).max(3);
+    if !rows.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section("NOT UPDATED"));
+        let first = result.scroll.min(rows.len().saturating_sub(room));
+        let shown = rows.len().min(room);
+        lines.extend(rows.into_iter().skip(first).take(shown));
+    }
+    lines.push(Line::raw(""));
+    let retry = r.failed.len() + r.skipped.len();
+    let retry_label = format!("r  retry the {retry} not updated");
+    let mut choices = Vec::new();
+    if retry > 0 {
+        choices.push((
+            retry_label.as_str(),
+            theme::pill(t.on_accent, t.accent),
+            Click::Key(KeyCode::Char('r')),
+        ));
+    }
+    choices.push((
+        "Esc  close",
+        Style::new().bg(t.select).fg(t.text),
+        Click::Key(KeyCode::Esc),
+    ));
+    let (row, spots) = buttons(lines.len(), &choices);
+    lines.push(row);
+    lines.push(Line::raw(""));
     let popup = centered(area, width, lines.len() as u16 + 2);
-    let inner = card(f, popup, "Exporting", t.accent);
+    let color = if r.failed.is_empty() { t.accent } else { t.err };
+    let title = if r.skipped.is_empty() {
+        "Update finished"
+    } else {
+        "Update stopped"
+    };
+    let inner = card(f, popup, title, color);
     f.render_widget(Paragraph::new(lines), inner);
+    register(app, popup, inner, spots);
 }
 
 // ---------------------------------------------------------------- keys and commands
 
-pub(super) fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     let t = theme::current();
     let mut entries: Vec<(&str, &str)> = app.bindings().iter().map(|b| (b.keys, b.label)).collect();
     if app.palette_allowed() {
@@ -810,10 +1271,11 @@ pub(super) fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             column,
         );
     }
-    f.render_widget(hint("any key closes"), note);
+    f.render_widget(hint("any key or click closes"), note);
+    register(app, popup, inner, Vec::new());
 }
 
-pub(super) fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_palette(f: &mut Frame, app: &mut App, area: Rect) {
     let t = theme::current();
     let Some(palette) = &app.palette else { return };
     let entries = app.palette_entries();
@@ -855,6 +1317,7 @@ pub(super) fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
     );
     if entries.is_empty() {
         f.render_widget(hint("No matching command"), list_area);
+        register(app, popup, inner, Vec::new());
         return;
     }
     let row_width = list_area.width.saturating_sub(2) as usize;
@@ -881,11 +1344,25 @@ pub(super) fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(spans))
         })
         .collect();
+    let count = entries.len();
     let mut state = ListState::default().with_selected(Some(palette.selected));
     let list = List::new(items)
         .highlight_style(theme::selected(true))
         .highlight_symbol(Span::styled("▌ ", theme::fg(t.accent)));
     f.render_stateful_widget(list, list_area, &mut state);
+    let first = usize::from(list_area.y - inner.y);
+    let spots = (0..list_area.height as usize)
+        .filter(|row| state.offset() + row < count)
+        .map(|row| {
+            (
+                first + row,
+                0,
+                u16::MAX,
+                Click::Palette(state.offset() + row),
+            )
+        })
+        .collect();
+    register(app, popup, inner, spots);
 }
 
 fn capitalize(s: &str) -> String {

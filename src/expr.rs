@@ -60,10 +60,21 @@ pub fn tokenize(text: &str, mode: Mode) -> Result<Vec<Token>> {
     let mut lx = Lexer::new(text);
     let mut out: Vec<Token> = Vec::new();
     while let Some(c) = lx.peek() {
-        let after_operand = matches!(
-            out.last(),
-            Some(Token::Path(_) | Token::Value(_) | Token::Sym(")"))
-        );
+        // In `ADD path value` and `DELETE path value` the value directly follows its path, so
+        // a minus there signs the number instead of subtracting.
+        let value_after_path = matches!(
+            out.iter().rev().find(|t| matches!(t, Token::Keyword(_))),
+            Some(Token::Keyword(k)) if k == "ADD" || k == "DELETE"
+        ) && matches!(out.last(), Some(Token::Path(_)))
+            && matches!(
+                out.len().checked_sub(2).map(|i| &out[i]),
+                Some(Token::Keyword(_) | Token::Sym(","))
+            );
+        let after_operand = !value_after_path
+            && matches!(
+                out.last(),
+                Some(Token::Path(_) | Token::Value(_) | Token::Sym(")"))
+            );
         let token = match c {
             c if c.is_whitespace() => {
                 lx.pos += 1;
@@ -582,6 +593,20 @@ mod tests {
             p.projection("pk, profile.city ,tags[1]").unwrap(),
             "#n0, #n1.#n2, #n3[1]"
         );
+    }
+
+    #[test]
+    fn a_minus_after_an_add_path_signs_the_number() {
+        let mut p = Placeholders::default();
+        let e = p
+            .update("ADD views -1, score -2.5 SET total = total -3")
+            .unwrap();
+        assert_eq!(e, "ADD #n0 :v0, #n1 :v1 SET #n2 = #n2 - :v2");
+        assert_eq!(
+            (p.values[":v0"].clone(), p.values[":v1"].clone()),
+            (n("-1"), n("-2.5"))
+        );
+        assert_eq!(p.values[":v2"], n("3"), "in SET it still subtracts");
     }
 
     #[test]

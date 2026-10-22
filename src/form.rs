@@ -117,6 +117,23 @@ impl ReadForm {
         }
     }
 
+    /// Puts the focus on `field`, as a click on its row does.
+    pub fn focus(&mut self, field: Field) {
+        self.field = field;
+    }
+
+    /// Sets a two-way choice: Query (0) or Scan (1), consistency off (0) or on (1), ascending
+    /// (0) or descending (1).
+    pub fn choose(&mut self, field: Field, option: usize) {
+        self.field = field;
+        match field {
+            Field::Mode => self.query = option == 0,
+            Field::Consistent => self.consistent = option == 1,
+            Field::Order => self.descending = option == 1,
+            _ => {}
+        }
+    }
+
     pub fn move_focus(&mut self, table: &TableInfo, delta: isize) {
         let fields = self.fields(table);
         let at = fields

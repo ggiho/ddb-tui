@@ -1,6 +1,7 @@
 //! DynamoDB calls used by the UI. Everything here is async and free of terminal state.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
@@ -408,6 +409,23 @@ pub async fn fetch_page(
     }
 }
 
+/// One Scan, Query or ExecuteStatement call, without filling up to a page: long reads use it
+/// to report progress and notice a cancel after every request, however selective the filter.
+pub async fn fetch_call(
+    client: &Client,
+    req: &ReadRequest,
+    start: Option<Cursor>,
+    limit: usize,
+) -> Result<Page> {
+    let call = fetch_once(client, req, start, limit as i32).await?;
+    Ok(Page {
+        items: call.items,
+        next: call.next,
+        consumed: call.consumed,
+        calls: vec![call.log],
+    })
+}
+
 struct Call {
     items: Vec<Item>,
     next: Option<Cursor>,
@@ -705,9 +723,9 @@ pub async fn update_item(
         .await;
     match out {
         Ok(out) => Ok((out.attributes().cloned(), units(out.consumed_capacity()))),
-        Err(e) if e.code() == Some("ConditionalCheckFailedException") => {
-            Err(anyhow!("The condition was not met; nothing was changed"))
-        }
+        Err(e) if e.code() == Some("ConditionalCheckFailedException") => Err(anyhow!(
+            "The condition was not met, or the item no longer exists; nothing was changed"
+        )),
         Err(e) => Err(sdk_err(e)),
     }
 }
@@ -748,37 +766,146 @@ pub async fn delete_items(client: &Client, table: &str, keys: Vec<Item>) -> Dele
     report
 }
 
+/// Fresh copies of `keys`, in order; `None` for an item that no longer exists.
+pub async fn get_items(
+    client: &Client,
+    table: &str,
+    keys: Vec<Item>,
+) -> Vec<(Item, Result<Option<Item>>)> {
+    let mut items = Vec::new();
+    for key in keys {
+        let item = get_item(client, table, key.clone()).await;
+        items.push((key, item));
+    }
+    items
+}
+
+/// How far an UpdateItem applied to several items has come.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UpdateProgress {
+    pub total: usize,
+    /// Updated or failed so far.
+    pub done: usize,
+    pub failed: usize,
+    pub consumed: f64,
+}
+
 /// How an UpdateItem applied to several items went.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct UpdateReport {
     pub requested: usize,
     pub updated: usize,
-    /// `key: error` for each item that was not updated, such as a failed condition.
-    pub failed: Vec<String>,
+    /// Each item that was not updated, with why, such as an unmet condition.
+    pub failed: Vec<(Item, String)>,
+    /// Items not sent because the update was cancelled.
+    pub skipped: Vec<Item>,
     pub consumed: Option<f64>,
 }
 
-/// Applies `req` to each key in turn. One failure, such as an unmet condition, does not stop
-/// the others.
-pub async fn update_items(client: &Client, req: &UpdateRequest, keys: Vec<Item>) -> UpdateReport {
+/// Requests in flight at once while updating many items.
+pub const UPDATE_CONCURRENCY: usize = 8;
+
+/// Applies `req` to each key, a few at a time. A failure, such as an unmet condition, does not
+/// stop the others; once `cancel` is set no more are sent and the rest are reported skipped.
+pub async fn update_items(
+    client: &Client,
+    req: &UpdateRequest,
+    keys: Vec<Item>,
+    cancel: &AtomicBool,
+    progress: impl Fn(UpdateProgress),
+) -> UpdateReport {
     let mut report = UpdateReport {
         requested: keys.len(),
-        updated: 0,
-        failed: Vec::new(),
-        consumed: None,
+        ..UpdateReport::default()
     };
-    for key in keys {
-        let label = item::item_to_plain_json(&key).to_string();
-        let one = UpdateRequest { key, ..req.clone() };
-        match update_item(client, one).await {
-            Ok((_, units)) => {
+    let mut status = UpdateProgress {
+        total: keys.len(),
+        ..UpdateProgress::default()
+    };
+    let mut pending = keys.into_iter();
+    let mut running = tokio::task::JoinSet::new();
+    loop {
+        while running.len() < UPDATE_CONCURRENCY && !cancel.load(Ordering::Relaxed) {
+            let Some(key) = pending.next() else { break };
+            let client = client.clone();
+            let one = UpdateRequest {
+                key: key.clone(),
+                ..req.clone()
+            };
+            running.spawn(async move { (key, update_item(&client, one).await) });
+        }
+        let Some(joined) = running.join_next().await else {
+            break;
+        };
+        match joined {
+            Ok((_, Ok((_, units)))) => {
                 report.updated += 1;
                 report.consumed = add(report.consumed, units);
             }
-            Err(e) => report.failed.push(format!("{label}: {e:#}")),
+            Ok((key, Err(e))) => report.failed.push((key, format!("{e:#}"))),
+            Err(e) => report.failed.push((Item::new(), format!("{e:#}"))),
+        }
+        status.done = report.updated + report.failed.len();
+        status.failed = report.failed.len();
+        status.consumed = report.consumed.unwrap_or(0.0);
+        progress(status);
+    }
+    report.skipped = pending.collect();
+    report
+}
+
+/// The keys of every item `req` reads, to apply one update to all of them. Only the key
+/// attributes are fetched. `None` when cancelled.
+pub async fn collect_keys(
+    client: &Client,
+    req: &ReadRequest,
+    base: &Index,
+    cancel: &AtomicBool,
+    progress: impl Fn(usize, f64),
+) -> Result<Option<Vec<Item>>> {
+    let req = with_key_projection(req, base);
+    let mut keys = Vec::new();
+    let mut consumed = 0.0;
+    let mut cursor = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let page = fetch_call(client, &req, cursor, 1000).await?;
+        consumed += page.consumed.unwrap_or(0.0);
+        keys.extend(page.items.iter().filter_map(|i| key_of(i, base)));
+        progress(keys.len(), consumed);
+        cursor = page.next;
+        if cursor.is_none() {
+            return Ok(Some(keys));
         }
     }
-    report
+}
+
+/// `req` reading only the table's key attributes. Names the old projection alone used are
+/// dropped, since DynamoDB rejects unused placeholders.
+fn with_key_projection(req: &ReadRequest, base: &Index) -> ReadRequest {
+    let mut req = req.clone();
+    if let ReadRequest::Scan { opts, .. } | ReadRequest::Query { opts, .. } = &mut req {
+        let filter = opts.filter.clone().unwrap_or_default();
+        opts.names
+            .retain(|placeholder, _| uses(&filter, placeholder));
+        let mut parts = Vec::new();
+        for (i, key) in base.keys().enumerate() {
+            let placeholder = format!("#ddbtuikey{i}");
+            opts.names.insert(placeholder.clone(), key.name.clone());
+            parts.push(placeholder);
+        }
+        opts.projection = Some(parts.join(", "));
+    }
+    req
+}
+
+/// Whether `expr` mentions `placeholder` as a whole token (`#n1` is not in `#n10`).
+fn uses(expr: &str, placeholder: &str) -> bool {
+    expr.match_indices(placeholder).any(|(at, _)| {
+        !expr[at + placeholder.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 #[cfg(test)]
@@ -787,6 +914,50 @@ mod tests {
 
     fn s(v: &str) -> AttributeValue {
         AttributeValue::S(v.into())
+    }
+
+    #[test]
+    fn key_projection_keeps_only_the_names_the_filter_uses() {
+        let base = Index {
+            name: None,
+            pk: Key {
+                name: "pk".into(),
+                ty: "S".into(),
+            },
+            sk: Some(Key {
+                name: "sk".into(),
+                ty: "N".into(),
+            }),
+            global: false,
+        };
+        let req = ReadRequest::Scan {
+            table: "t".into(),
+            index: None,
+            opts: ReadOptions {
+                filter: Some("#n10 = :v0".into()),
+                projection: Some("#n1, #n10".into()),
+                names: HashMap::from([
+                    ("#n1".to_string(), "name".to_string()),
+                    ("#n10".to_string(), "status".to_string()),
+                ]),
+                ..ReadOptions::default()
+            },
+        };
+        let ReadRequest::Scan { opts, .. } = with_key_projection(&req, &base) else {
+            unreachable!()
+        };
+        assert_eq!(opts.projection.as_deref(), Some("#ddbtuikey0, #ddbtuikey1"));
+        let mut names: Vec<_> = opts.names.into_iter().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                ("#ddbtuikey0".to_string(), "pk".to_string()),
+                ("#ddbtuikey1".to_string(), "sk".to_string()),
+                ("#n10".to_string(), "status".to_string()),
+            ],
+            "#n1 was only in the projection"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod form;
 pub mod highlight;
 pub mod item;
 pub mod pager;
+pub mod preview;
 pub mod profiles;
 pub mod saved;
 pub mod settings;

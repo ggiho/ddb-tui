@@ -113,7 +113,8 @@ fn create_private(path: &Path) -> Result<File> {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Progress {
     pub items: usize,
-    pub pages: usize,
+    /// DynamoDB requests made; each reads up to 1 MB.
+    pub requests: usize,
     pub consumed: f64,
 }
 
@@ -129,7 +130,7 @@ pub struct Summary {
 const EXPORT_PAGE: usize = 1000;
 
 /// Reads every page of `req` and writes it to `path` as it arrives. `keys` are the columns a
-/// CSV starts with. Stops between pages once `cancel` is set, removing what was written; a
+/// CSV starts with. Stops between requests once `cancel` is set, removing what was written; a
 /// failure removes it too.
 pub async fn export_all(
     client: &Client,
@@ -147,10 +148,10 @@ pub async fn export_all(
             if cancel.load(Ordering::Relaxed) {
                 return Ok(true);
             }
-            let page = ddb::fetch_page(client, req, cursor, EXPORT_PAGE).await?;
+            let page = ddb::fetch_call(client, req, cursor, EXPORT_PAGE).await?;
             writer.write(&page.items)?;
             done.items += page.items.len();
-            done.pages += 1;
+            done.requests += 1;
             done.consumed += page.consumed.unwrap_or(0.0);
             progress(done);
             cursor = page.next;

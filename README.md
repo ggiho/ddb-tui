@@ -85,8 +85,10 @@ read_only = production                             # production (default), all o
 ## Keys
 
 Press `?` on any screen for its full key list, or `Ctrl+P` to search the commands. The mouse
-works too: the wheel scrolls the list under it, a click selects and focuses, a double click
-opens. To select text with the mouse, hold Shift (Option in Terminal.app and iTerm2) or start with
+works too: the wheel scrolls the list under it (Shift, or a sideways wheel, moves between cells),
+a click selects a cell, table or connection and focuses its pane, a double click opens it, and
+in popups a click presses buttons, picks rows, fields and options, or closes the popup from
+outside. To select text with the mouse, hold Shift (Option in Terminal.app and iTerm2) or start with
 `--no-mouse`. The most used keys:
 
 | Screen | Keys |
@@ -95,9 +97,25 @@ opens. To select text with the mouse, hold Shift (Option in Terminal.app and iTe
 | Connections | `/` search profile, region or account · `Enter` connect |
 | Tables | `Enter` open (scan) · `/` search · `t` details · `x` PartiQL · `R` region · `o` saved operations |
 | Export (`E`) | `Tab` this page / all results · `Enter` write · `Esc` cancel (also stops a running export) |
-| Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update (all marked rows when some are marked) · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` cells · `v` copy cell · `g` query by the cell value |
+| Items | `/` search this page · `f` scan/query form (server-side filter) · `n`/`p` page · `Enter` view · `e` edit · `u` update (the selection, the page or all results) · `a` add · `c` copy as new · `space` mark · `d` delete · `y`/`Y` copy JSON · `E` export · `i` requests · `w` save read · `+`/`-` page size · `←`/`→` cells · `v` copy cell · `g` query by the cell value |
 | Detail | `v` DynamoDB / plain JSON · `e` edit · `u` update · `d` delete · `c` copy as new · `y`/`Y` copy JSON |
 | Forms | `Tab` complete attribute name or next field · `←`/`→` change choice · `Enter` run |
+
+## Updating many items
+
+`u` opens one UpdateItem for the selected item, the marked rows, every row of the page, or all
+results: every item the current Scan or Query matches, on all pages. For all results the keys
+are read first (only the key attributes, after a confirmation with the read's cost) and the
+update runs only once their exact count is typed. Only items that still exist are updated, so
+a key whose item was deleted in the meantime is not created again. The confirmation previews
+the first items, read again so that projected or stale rows do not mislead: each touched
+attribute's current value and the new one, worked out locally for `SET` with values, `+`/`-`,
+`if_not_exists` and `list_append`, and for `REMOVE`, `ADD` and `DELETE`; the condition is left
+to DynamoDB.
+
+Items are sent eight at a time with a progress popup, and Esc stops sending (updates already sent
+still finish). The result lists every item not updated with the reason, such as an unmet
+condition, and `r` retries those, along with any not sent.
 
 ## Expressions
 

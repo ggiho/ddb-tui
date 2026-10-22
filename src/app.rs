@@ -29,6 +29,7 @@ use crate::expr::Placeholders;
 use crate::form::{Field, FieldError, ReadForm};
 use crate::item::{self, Item};
 use crate::pager::Pager;
+use crate::preview;
 use crate::profiles::ProfileInfo;
 use crate::saved;
 use crate::settings::{ReadOnly, Settings};
@@ -80,6 +81,20 @@ pub enum Msg {
     /// How far a whole-result export has come; not a reply, so it does not end a request.
     ExportProgress(export::Progress),
     Exported(anyhow::Result<export::Summary>),
+    /// Keys found so far for an update of all results; a progress report too.
+    CollectProgress {
+        found: usize,
+        consumed: f64,
+    },
+    /// The keys of all results, or `None` when cancelled.
+    Collected(anyhow::Result<Option<Vec<Item>>>),
+    /// How far an update of many items has come; a progress report too.
+    UpdateProgress(ddb::UpdateProgress),
+    /// Fresh copies for an update preview; `id` drops answers to an earlier confirmation.
+    PreviewItems {
+        id: u64,
+        items: Vec<(Item, anyhow::Result<Option<Item>>)>,
+    },
     /// The full item fetched for the editor, or `None` if it no longer exists.
     Loaded {
         kind: EditKind,
@@ -273,7 +288,17 @@ const EXPORT_PROMPT_KEYS: &[Binding] = &[
     hint("Tab", "this page / all results"),
     hint("Esc", "cancel"),
 ];
-const EXPORT_KEYS: &[Binding] = &[hint("Esc", "cancel the export")];
+const JOB_KEYS: &[Binding] = &[hint("Esc", "cancel")];
+const COUNT_PROMPT_KEYS: &[Binding] = &[
+    hint("type", "the count"),
+    hint("Enter", "update"),
+    hint("Esc", "cancel"),
+];
+const RESULT_KEYS: &[Binding] = &[
+    hint("r", "retry what did not succeed"),
+    hint("↑↓", "scroll"),
+    hint("Esc", "close"),
+];
 const CONFIRM_KEYS: &[Binding] = &[hint("y", "yes"), hint("n / Esc", "cancel")];
 const PALETTE_KEYS: &[Binding] = &[
     hint("type", "filter"),
@@ -342,12 +367,16 @@ pub enum Confirm {
     ExportAll {
         path: String,
     },
+    /// Read the keys of every result before an update of them all (whose count is typed next).
+    CollectAll(Box<ddb::UpdateRequest>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptAction {
     Export,
     SaveOperation,
+    /// The number of items to type before an update of all results runs.
+    ConfirmCount,
 }
 
 /// A one-line text prompt: the export file name or a saved operation name.
@@ -361,14 +390,40 @@ pub struct Prompt {
     pub scope: String,
 }
 
-/// Where the last drawing put the lists the mouse can click and scroll; empty when hidden.
-#[derive(Clone, Copy, Debug, Default)]
+/// Where the last drawing put what the mouse can click and scroll; empty when hidden.
+#[derive(Clone, Debug, Default)]
 pub struct HitAreas {
     pub connections: Rect,
     pub tables: Rect,
     /// The item rows, below the grid's header.
     pub rows: Rect,
+    /// Each grid column on screen: x, width and index into `columns()`.
+    pub columns: Vec<(u16, u16, usize)>,
+    pub preview: Rect,
     pub detail: Rect,
+    /// The topmost popup, so that a click outside closes it.
+    pub popup: Rect,
+    /// Clickable spots of the topmost popup.
+    pub buttons: Vec<(Rect, Click)>,
+}
+
+/// What a click on a popup spot does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Click {
+    Key(KeyCode),
+    /// A command palette entry: choose and run it.
+    Palette(usize),
+    /// A region or saved-operation row: select, and choose on a double click.
+    ListRow(usize),
+    FormField(Field),
+    /// A two-way choice of the read form and the option clicked.
+    FormChoice(Field, usize),
+    /// The arrows of a cycling field such as the index.
+    FormStep(Field, isize),
+    UpdateField(UpdateField),
+    UpdateScope(UpdateScope),
+    /// The export prompt's scope: all results or this page.
+    ExportScope(bool),
 }
 
 /// The list a click landed in, for telling a double click.
@@ -377,14 +432,44 @@ enum Clicked {
     Connection,
     Table,
     Row,
+    PopupRow,
 }
 
-/// A whole-result export in progress; Esc sets `cancel`.
-pub struct ExportJob {
-    pub path: String,
-    pub progress: export::Progress,
+/// Background work shown in a progress popup; Esc sets `cancel`.
+pub struct Job {
+    pub kind: JobKind,
     pub started: Instant,
     cancel: Arc<AtomicBool>,
+}
+
+pub enum JobKind {
+    Export {
+        path: String,
+        progress: export::Progress,
+    },
+    /// Reading the keys of every item the read matches, before updating them all.
+    Collect { found: usize, consumed: f64 },
+    Update {
+        req: Box<ddb::UpdateRequest>,
+        progress: ddb::UpdateProgress,
+    },
+}
+
+/// The preview of one item in an update confirmation.
+pub enum ItemPreview {
+    Changes(Vec<preview::Change>),
+    /// The item no longer exists, so the update skips it.
+    Gone,
+    /// It could not be read, with why.
+    Unread(String),
+}
+
+/// How an update of many items went, shown until closed; `r` retries what did not succeed.
+pub struct BatchResult {
+    pub report: UpdateReport,
+    pub req: ddb::UpdateRequest,
+    pub secs: u64,
+    pub scroll: usize,
 }
 
 /// The UpdateItem popup. Texts are kept between uses, so one update can be applied to
@@ -393,7 +478,38 @@ pub struct ExportJob {
 pub struct UpdateForm {
     pub update: String,
     pub condition: String,
-    pub on_condition: bool,
+    pub field: UpdateField,
+    pub scope: UpdateScope,
+}
+
+impl UpdateForm {
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self.field {
+            UpdateField::Update => Some(&mut self.update),
+            UpdateField::Condition => Some(&mut self.condition),
+            UpdateField::Scope => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpdateField {
+    #[default]
+    Update,
+    Condition,
+    Scope,
+}
+
+/// Which items an update applies to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpdateScope {
+    /// The marked rows, or the selected item.
+    #[default]
+    Selection,
+    /// Every row the page shows.
+    Page,
+    /// Every item the current read matches, across all pages.
+    All,
 }
 
 pub struct App {
@@ -456,10 +572,19 @@ pub struct App {
     pub saved_state: ListState,
     pub show_help: bool,
     pub palette: Option<Palette>,
-    pub export_job: Option<ExportJob>,
+    pub job: Option<Job>,
+    pub batch_result: Option<BatchResult>,
+    /// An update of all results: the request and, once read, the keys awaiting the typed count.
+    pending_update: Option<(ddb::UpdateRequest, Vec<Item>)>,
     /// Filled in by every drawing.
     pub hit: HitAreas,
     last_click: Option<(Instant, Clicked, usize)>,
+    /// Lines the preview pane is scrolled by, and the row it applies to.
+    pub preview_scroll: u16,
+    pub preview_row: Option<usize>,
+    /// Fresh copies of the items an update confirmation previews; `None` while reading.
+    preview_items: Option<Vec<FreshItem>>,
+    preview_id: u64,
     pub status: Status,
     status_at: Instant,
     /// Requests in flight; drives the loading indicator.
@@ -539,9 +664,15 @@ impl App {
             saved_state: ListState::default(),
             show_help: false,
             palette: None,
-            export_job: None,
+            job: None,
+            batch_result: None,
+            pending_update: None,
             hit: HitAreas::default(),
             last_click: None,
+            preview_scroll: 0,
+            preview_row: None,
+            preview_items: None,
+            preview_id: 0,
             status: Status::Info(String::new()),
             status_at: Instant::now(),
             busy: 0,
@@ -666,8 +797,10 @@ impl App {
 
     /// The keys that apply right now, for the footer and the key list.
     pub fn bindings(&self) -> &'static [Binding] {
-        if self.export_job.is_some() {
-            EXPORT_KEYS
+        if self.job.is_some() {
+            JOB_KEYS
+        } else if self.batch_result.is_some() {
+            RESULT_KEYS
         } else if self.palette.is_some() {
             PALETTE_KEYS
         } else if self
@@ -676,6 +809,12 @@ impl App {
             .is_some_and(|p| p.action == PromptAction::Export)
         {
             EXPORT_PROMPT_KEYS
+        } else if self
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.action == PromptAction::ConfirmCount)
+        {
+            COUNT_PROMPT_KEYS
         } else if self.prompt.is_some() {
             PROMPT_KEYS
         } else if self.confirm.is_some() {
@@ -709,7 +848,8 @@ impl App {
     pub fn palette_allowed(&self) -> bool {
         self.prompt.is_none()
             && self.confirm.is_none()
-            && self.export_job.is_none()
+            && self.job.is_none()
+            && self.batch_result.is_none()
             && matches!(
                 self.screen,
                 Screen::Connections | Screen::Tables | Screen::Items | Screen::Detail
@@ -915,20 +1055,89 @@ impl App {
     }
 
     pub fn on_msg(&mut self, msg: Msg) {
-        if !matches!(msg, Msg::ExportProgress(_)) {
+        if !matches!(
+            msg,
+            Msg::ExportProgress(_) | Msg::CollectProgress { .. } | Msg::UpdateProgress(_)
+        ) {
             self.busy = self.busy.saturating_sub(1);
         }
         match msg {
             Msg::ExportProgress(p) => {
-                if let Some(job) = &mut self.export_job {
-                    job.progress = p;
+                if let Some(Job {
+                    kind: JobKind::Export { progress, .. },
+                    ..
+                }) = &mut self.job
+                {
+                    *progress = p;
+                }
+            }
+            Msg::CollectProgress { found, consumed } => {
+                if let Some(Job {
+                    kind:
+                        JobKind::Collect {
+                            found: f,
+                            consumed: c,
+                        },
+                    ..
+                }) = &mut self.job
+                {
+                    (*f, *c) = (found, consumed);
+                }
+            }
+            Msg::UpdateProgress(p) => {
+                if let Some(Job {
+                    kind: JobKind::Update { progress, .. },
+                    ..
+                }) = &mut self.job
+                {
+                    *progress = p;
+                }
+            }
+            Msg::PreviewItems { id, items } => {
+                if id == self.preview_id {
+                    self.preview_items = Some(
+                        items
+                            .into_iter()
+                            .map(|(k, r)| (k, r.map_err(|e| format!("{e:#}"))))
+                            .collect(),
+                    );
+                }
+            }
+            Msg::Collected(result) => {
+                self.job = None;
+                match result {
+                    Ok(Some(keys)) if !keys.is_empty() => {
+                        let first: Vec<Item> = keys.iter().take(PREVIEW_ITEMS).cloned().collect();
+                        if let Some((_, pending)) = &mut self.pending_update {
+                            *pending = keys;
+                        }
+                        self.prompt = Some(count_prompt());
+                        self.load_preview(first);
+                    }
+                    Ok(Some(_)) => {
+                        self.pending_update = None;
+                        self.info("Nothing matches the read; nothing to update");
+                    }
+                    Ok(None) => {
+                        self.pending_update = None;
+                        self.info("Cancelled; nothing was updated");
+                    }
+                    Err(e) => {
+                        self.pending_update = None;
+                        self.error(e);
+                    }
                 }
             }
             Msg::Exported(result) => {
-                let job = self.export_job.take();
-                let (path, secs) = job
-                    .map(|j| (j.path, j.started.elapsed().as_secs()))
-                    .unwrap_or_default();
+                let job = self.job.take();
+                let (path, secs) = match job {
+                    Some(Job {
+                        kind: JobKind::Export { path, .. },
+                        started,
+                        ..
+                    }) => (path, started.elapsed().as_secs()),
+                    _ => Default::default(),
+                };
                 match result {
                     Ok(s) if s.cancelled => {
                         self.info("Export cancelled; the partial file was removed")
@@ -1077,19 +1286,19 @@ impl App {
             },
             Msg::UpdatedMany(report) => {
                 self.marked.clear();
-                if report.failed.is_empty() {
-                    self.ok(format!(
-                        "Updated {} items{}",
-                        report.updated,
-                        wcu(report.consumed)
-                    ));
-                } else {
-                    self.error(format!(
-                        "Updated {} of {}; {}",
-                        report.updated,
-                        report.requested,
-                        report.failed.join("; ")
-                    ));
+                if let Some(Job {
+                    kind: JobKind::Update { req, .. },
+                    started,
+                    ..
+                }) = self.job.take()
+                {
+                    self.info("");
+                    self.batch_result = Some(BatchResult {
+                        report,
+                        req: *req,
+                        secs: started.elapsed().as_secs(),
+                        scroll: 0,
+                    });
                 }
                 self.refresh();
             }
@@ -1113,12 +1322,16 @@ impl App {
             self.show_help = false;
             return;
         }
-        // An export runs until it ends or Esc cancels it; other keys wait.
-        if let Some(job) = &self.export_job {
+        // A job runs until it ends or Esc cancels it; other keys wait.
+        if let Some(job) = &self.job {
             if key.code == KeyCode::Esc {
                 job.cancel.store(true, Ordering::Relaxed);
-                self.progress("Cancelling the export…");
+                self.progress("Cancelling…");
             }
+            return;
+        }
+        if self.batch_result.is_some() {
+            self.key_batch_result(key.code);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
@@ -1170,21 +1383,32 @@ impl App {
         }
     }
 
-    /// Scrolling moves the list under the pointer; a click selects a row, table or connection
-    /// and focuses its pane, and a double click opens it. Popups take no mouse input.
+    /// Scrolling moves what is under the pointer (Shift or a sideways wheel moves the cell
+    /// cursor); a click selects a cell, table or connection and focuses its pane, and a double
+    /// click opens it. In a popup, clicks press its buttons and pick its rows and fields, and a
+    /// click outside closes it.
     pub fn on_mouse(&mut self, m: MouseEvent) {
         let popup = self.confirm.is_some()
             || self.prompt.is_some()
             || self.palette.is_some()
             || self.show_help
-            || self.export_job.is_some()
+            || self.job.is_some()
+            || self.batch_result.is_some()
             || self.screen != self.base_screen();
+        let at = Position::new(m.column, m.row);
+        let hit = self.hit.clone();
         if popup {
+            self.mouse_in_popup(m, at, &hit);
             return;
         }
-        let at = Position::new(m.column, m.row);
-        let hit = self.hit;
+        let sideways = m.modifiers.contains(KeyModifiers::SHIFT);
         match m.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if sideways => {
+                self.move_cell_cursor(m.kind == MouseEventKind::ScrollDown)
+            }
+            MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft if hit.rows.contains(at) => {
+                self.move_cell_cursor(m.kind == MouseEventKind::ScrollRight)
+            }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let delta = if m.kind == MouseEventKind::ScrollDown {
                     3
@@ -1203,12 +1427,10 @@ impl App {
                     let n = self.visible_connections().len();
                     self.conn_state
                         .select(step(self.conn_state.selected(), n, delta));
+                } else if hit.preview.contains(at) {
+                    self.preview_scroll = scroll_by(self.preview_scroll, delta);
                 } else if hit.detail.contains(at) {
-                    self.detail_scroll = if delta > 0 {
-                        self.detail_scroll.saturating_add(3)
-                    } else {
-                        self.detail_scroll.saturating_sub(3)
-                    };
+                    self.detail_scroll = scroll_by(self.detail_scroll, delta);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1216,6 +1438,13 @@ impl App {
                     let row = self.item_state.offset() + usize::from(at.y - hit.rows.y);
                     if row < self.visible_rows().len() {
                         self.item_state.select(Some(row));
+                        if let Some(&(_, _, col)) = hit
+                            .columns
+                            .iter()
+                            .find(|(x, w, _)| (*x..x + w).contains(&at.x))
+                        {
+                            self.col_cursor = col;
+                        }
                         self.screen = Screen::Items;
                         if self.double_click(Clicked::Row, row) {
                             self.on_key(KeyEvent::from(KeyCode::Enter));
@@ -1244,6 +1473,90 @@ impl App {
         }
     }
 
+    fn move_cell_cursor(&mut self, right: bool) {
+        let code = if right { KeyCode::Right } else { KeyCode::Left };
+        if self.screen == Screen::Items {
+            self.on_key(KeyEvent::from(code));
+        }
+    }
+
+    fn mouse_in_popup(&mut self, m: MouseEvent, at: Position, hit: &HitAreas) {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.show_help {
+                    self.show_help = false;
+                } else if let Some(&(_, click)) =
+                    hit.buttons.iter().rev().find(|(r, _)| r.contains(at))
+                {
+                    self.click(click);
+                } else if !hit.popup.contains(at) && self.job.is_none() {
+                    // A running job only stops on Esc, never on a stray click.
+                    let key = if self.confirm.is_some() {
+                        KeyCode::Char('n')
+                    } else {
+                        KeyCode::Esc
+                    };
+                    self.on_key(KeyEvent::from(key));
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = m.kind == MouseEventKind::ScrollDown;
+                let lists = self.palette.is_some()
+                    || self.batch_result.is_some()
+                    || matches!(self.screen, Screen::Regions | Screen::Saved);
+                if lists && self.confirm.is_none() && self.prompt.is_none() {
+                    self.on_key(KeyEvent::from(if down {
+                        KeyCode::Down
+                    } else {
+                        KeyCode::Up
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn click(&mut self, click: Click) {
+        match click {
+            Click::Key(code) => self.on_key(KeyEvent::from(code)),
+            Click::Palette(i) => {
+                if let Some(p) = &mut self.palette {
+                    p.selected = i;
+                }
+                self.on_key(KeyEvent::from(KeyCode::Enter));
+            }
+            Click::ListRow(i) => {
+                let state = match self.screen {
+                    Screen::Regions => &mut self.region_state,
+                    Screen::Saved => &mut self.saved_state,
+                    _ => return,
+                };
+                state.select(Some(i));
+                if self.double_click(Clicked::PopupRow, i) {
+                    self.on_key(KeyEvent::from(KeyCode::Enter));
+                }
+            }
+            Click::FormField(field) => self.form.focus(field),
+            Click::FormChoice(field, option) => self.form.choose(field, option),
+            Click::FormStep(field, delta) => {
+                self.form.focus(field);
+                if let Some(t) = self.table.clone() {
+                    self.form.change(&t, delta);
+                }
+            }
+            Click::UpdateField(field) => self.update_form.field = field,
+            Click::UpdateScope(scope) => {
+                self.update_form.field = UpdateField::Scope;
+                self.update_form.scope = scope;
+            }
+            Click::ExportScope(all) => {
+                if let Some(p) = &mut self.prompt {
+                    p.all = all;
+                }
+            }
+        }
+    }
+
     /// Whether this click repeats the last one on the same entry within half a second.
     fn double_click(&mut self, list: Clicked, index: usize) -> bool {
         let now = Instant::now();
@@ -1256,6 +1569,38 @@ impl App {
             Some((now, list, index))
         };
         double
+    }
+
+    fn key_batch_result(&mut self, code: KeyCode) {
+        let Some(result) = self.batch_result.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => result.scroll = result.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                let rows = result.report.failed.len() + result.report.skipped.len();
+                result.scroll = (result.scroll + 1).min(rows.saturating_sub(1));
+            }
+            KeyCode::Char('r') => {
+                let keys: Vec<Item> = result
+                    .report
+                    .failed
+                    .iter()
+                    .map(|(k, _)| k.clone())
+                    .filter(|k| !k.is_empty())
+                    .chain(result.report.skipped.iter().cloned())
+                    .collect();
+                if keys.is_empty() {
+                    self.info("Nothing to retry");
+                    return;
+                }
+                let req = result.req.clone();
+                self.batch_result = None;
+                self.confirm_update(req, keys, 0);
+            }
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.batch_result = None,
+            _ => {}
+        }
     }
 
     fn key_palette(&mut self, code: KeyCode) {
@@ -1371,6 +1716,7 @@ impl App {
                 Some(Confirm::UpdateMany { req, keys, .. }) => self.update_many(req, keys),
                 Some(Confirm::Statement(statement)) => self.run_statement(statement),
                 Some(Confirm::ExportAll { path }) => self.export_all(path),
+                Some(Confirm::CollectAll(req)) => self.collect_for_update(*req),
                 Some(Confirm::AllowWrites) => {
                     self.writes_allowed = true;
                     self.ok("Writes allowed for this session · W turns them off");
@@ -1392,6 +1738,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.prompt = None;
+                self.pending_update = None;
                 self.info("Cancelled");
             }
             KeyCode::Tab if prompt.action == PromptAction::Export => prompt.all = !prompt.all,
@@ -1403,6 +1750,20 @@ impl App {
                     PromptAction::Export if all => self.confirm_export_all(text),
                     PromptAction::Export => self.export(&text),
                     PromptAction::SaveOperation => self.save_operation(&text),
+                    PromptAction::ConfirmCount => {
+                        let count = self.pending_update.as_ref().map_or(0, |(_, k)| k.len());
+                        if text.replace([',', ' '], "") == count.to_string() {
+                            if let Some((req, keys)) = self.pending_update.take() {
+                                self.update_many(req, keys);
+                            }
+                        } else {
+                            // The keys stay, so a slip does not cost another full read.
+                            self.prompt = Some(count_prompt());
+                            self.error(format!(
+                                "Typed {text:?}, not {count}; nothing was updated. Try again or Esc"
+                            ));
+                        }
+                    }
                 }
             }
             KeyCode::Char(c) => prompt.text.push(c),
@@ -2408,9 +2769,11 @@ impl App {
         let (cols, keys) = self.columns();
         let key_columns = cols[..keys].to_vec();
         let cancel = Arc::new(AtomicBool::new(false));
-        self.export_job = Some(ExportJob {
-            path: path.clone(),
-            progress: export::Progress::default(),
+        self.job = Some(Job {
+            kind: JobKind::Export {
+                path: path.clone(),
+                progress: export::Progress::default(),
+            },
             started: Instant::now(),
             cancel: cancel.clone(),
         });
@@ -2465,7 +2828,8 @@ impl App {
         self.update_target = Some((table, keys, hidden));
         self.update_return = back;
         // Texts stay for the next item; focus always starts on the update expression.
-        self.update_form.on_condition = false;
+        self.update_form.field = UpdateField::Update;
+        self.update_form.scope = UpdateScope::Selection;
         self.update_error = None;
         self.hint.clear();
         self.screen = Screen::Update;
@@ -2476,51 +2840,205 @@ impl App {
         if code != KeyCode::Tab {
             self.hint.clear();
         }
-        let form = &mut self.update_form;
-        let field = if form.on_condition {
-            &mut form.condition
+        let fields: &[UpdateField] = if self.update_scopes().len() > 1 {
+            &[
+                UpdateField::Update,
+                UpdateField::Condition,
+                UpdateField::Scope,
+            ]
         } else {
-            &mut form.update
+            &[UpdateField::Update, UpdateField::Condition]
         };
+        let at = fields
+            .iter()
+            .position(|f| *f == self.update_form.field)
+            .unwrap_or(0);
+        let move_by =
+            |delta: isize| fields[(at as isize + delta).rem_euclid(fields.len() as isize) as usize];
         match code {
             KeyCode::Esc => self.screen = self.update_return,
             KeyCode::Tab => {
                 let names = self.completion_names();
                 let form = &mut self.update_form;
-                let field = if form.on_condition {
-                    &mut form.condition
-                } else {
-                    &mut form.update
+                let completed = match form.field {
+                    UpdateField::Update => complete_into(&names, &mut form.update, &mut self.hint),
+                    UpdateField::Condition => {
+                        complete_into(&names, &mut form.condition, &mut self.hint)
+                    }
+                    UpdateField::Scope => false,
                 };
-                if !complete_into(&names, field, &mut self.hint) {
+                if !completed {
                     self.hint.clear();
-                    form.on_condition = !form.on_condition;
+                    form.field = move_by(1);
                 }
             }
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                form.on_condition = !form.on_condition
+            KeyCode::BackTab | KeyCode::Up => self.update_form.field = move_by(-1),
+            KeyCode::Down => self.update_form.field = move_by(1),
+            KeyCode::Left | KeyCode::Right if self.update_form.field == UpdateField::Scope => {
+                let scopes: Vec<UpdateScope> =
+                    self.update_scopes().into_iter().map(|(s, _)| s).collect();
+                let i = scopes
+                    .iter()
+                    .position(|s| *s == self.update_form.scope)
+                    .unwrap_or(0);
+                let delta = if code == KeyCode::Left { -1 } else { 1 };
+                let next = (i as isize + delta).clamp(0, scopes.len() as isize - 1) as usize;
+                self.update_form.scope = scopes[next];
             }
-            KeyCode::Char(c) => field.push(c),
+            KeyCode::Char(c) => {
+                if let Some(text) = self.update_form.text_mut() {
+                    text.push(c);
+                }
+            }
             KeyCode::Backspace => {
-                field.pop();
+                if let Some(text) = self.update_form.text_mut() {
+                    text.pop();
+                }
             }
             KeyCode::Enter => match self.update_request() {
-                Ok(req) => {
-                    let (keys, hidden) = self
-                        .update_target
-                        .as_ref()
-                        .map(|(_, keys, hidden)| (keys.clone(), *hidden))
-                        .unwrap_or_default();
-                    self.confirm = Some(if keys.len() > 1 {
-                        Confirm::UpdateMany { req, keys, hidden }
-                    } else {
-                        Confirm::Update(req)
-                    });
-                }
                 Err(e) => self.update_error = Some(e),
+                Ok(req) => match self.update_form.scope {
+                    UpdateScope::Selection => {
+                        let (keys, hidden) = self
+                            .update_target
+                            .as_ref()
+                            .map(|(_, keys, hidden)| (keys.clone(), *hidden))
+                            .unwrap_or_default();
+                        self.confirm_update(req, keys, hidden);
+                    }
+                    UpdateScope::Page => {
+                        let base = self.table.as_ref().map(|t| t.base().clone());
+                        let keys: Option<Vec<Item>> = self
+                            .visible_rows()
+                            .iter()
+                            .map(|&i| ddb::key_of(&self.items()[i], base.as_ref()?))
+                            .collect();
+                        match keys {
+                            Some(keys) => self.confirm_update(req, keys, 0),
+                            None => self.info(
+                                "A row lacks the table's key attributes; include them in the projection",
+                            ),
+                        }
+                    }
+                    UpdateScope::All => self.confirm = Some(Confirm::CollectAll(Box::new(req))),
+                },
             },
             _ => {}
         }
+    }
+
+    /// Where the update form can apply: the selection, the page and every result. Opened
+    /// from the item view it applies to that item only.
+    pub fn update_scopes(&self) -> Vec<(UpdateScope, String)> {
+        let selection = match self.update_count() {
+            n if n > 1 => format!("{n} marked"),
+            _ => "this item".to_string(),
+        };
+        let mut scopes = vec![(UpdateScope::Selection, selection)];
+        if self.update_return == Screen::Items {
+            scopes.push((
+                UpdateScope::Page,
+                format!("this page ({})", self.visible_rows().len()),
+            ));
+            scopes.push((UpdateScope::All, "all results".to_string()));
+        }
+        scopes
+    }
+
+    fn confirm_update(&mut self, req: ddb::UpdateRequest, keys: Vec<Item>, hidden: usize) {
+        if keys.is_empty() {
+            self.info("Nothing to update: no row is shown");
+            return;
+        }
+        self.load_preview(keys.iter().take(PREVIEW_ITEMS).cloned().collect());
+        self.confirm = Some(if keys.len() == 1 {
+            Confirm::Update(ddb::UpdateRequest {
+                key: keys[0].clone(),
+                ..req
+            })
+        } else {
+            Confirm::UpdateMany { req, keys, hidden }
+        });
+    }
+
+    /// Reads fresh, complete copies of the first items an update applies to, so its preview
+    /// is right even when the loaded rows are projected or stale.
+    fn load_preview(&mut self, keys: Vec<Item>) {
+        self.preview_id += 1;
+        let id = self.preview_id;
+        self.preview_items = None;
+        let (Some(client), Some(table)) = (self.client.clone(), self.request_table()) else {
+            return;
+        };
+        self.spawn(async move {
+            Msg::PreviewItems {
+                id,
+                items: ddb::get_items(&client, &table, keys).await,
+            }
+        });
+    }
+
+    /// Reads the keys of every item the current read matches, then asks for their count
+    /// to be typed before updating them all.
+    fn collect_for_update(&mut self, req: ddb::UpdateRequest) {
+        let (Some(client), Some(read), Some(info)) = (
+            self.client.clone(),
+            self.request.clone(),
+            self.table.clone(),
+        ) else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.job = Some(Job {
+            kind: JobKind::Collect {
+                found: 0,
+                consumed: 0.0,
+            },
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        self.pending_update = Some((req, Vec::new()));
+        self.screen = self.update_return;
+        self.busy += 1;
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let progress_tx = tx.clone();
+            let result = ddb::collect_keys(
+                &client,
+                &read,
+                info.base(),
+                &cancel,
+                move |found, consumed| {
+                    let _ = progress_tx.send(Msg::CollectProgress { found, consumed });
+                },
+            )
+            .await;
+            let _ = tx.send(Msg::Collected(result));
+        });
+    }
+
+    /// What the update would do to the first items it applies to, worked out on fresh copies
+    /// read when the confirmation opened; `None` while they are still being read.
+    pub fn update_preview(&self, req: &ddb::UpdateRequest) -> Option<Vec<(Item, ItemPreview)>> {
+        let items = self.preview_items.as_ref()?;
+        Some(
+            items
+                .iter()
+                .map(|(key, item)| {
+                    let preview = match item {
+                        Ok(Some(item)) => ItemPreview::Changes(preview::preview(
+                            item,
+                            &req.update,
+                            &req.names,
+                            &req.values,
+                        )),
+                        Ok(None) => ItemPreview::Gone,
+                        Err(e) => ItemPreview::Unread(e.clone()),
+                    };
+                    (key.clone(), preview)
+                })
+                .collect(),
+        )
     }
 
     /// The update to confirm, or which field is wrong (`true` for the condition) and why.
@@ -2535,10 +3053,24 @@ impl App {
             .update(&self.update_form.update)
             .map_err(|e| (false, format!("{e:#}")))?;
         let cond = self.update_form.condition.trim();
-        let condition = (!cond.is_empty())
+        let typed = (!cond.is_empty())
             .then(|| ph.condition(cond))
             .transpose()
             .map_err(|e| (true, format!("{e:#}")))?;
+        // UpdateItem creates a missing item, so a key whose item was deleted meanwhile would
+        // come back holding only the updated attributes. Only existing items are updated.
+        let pk = self
+            .table
+            .as_ref()
+            .filter(|t| t.name == table)
+            .map(|t| t.base().pk.name.clone())
+            .ok_or((false, "Table details are still loading".to_string()))?;
+        ph.names.insert(EXISTS_PLACEHOLDER.into(), pk);
+        let exists = format!("attribute_exists({EXISTS_PLACEHOLDER})");
+        let condition = Some(match typed {
+            Some(c) => format!("({c}) AND {exists}"),
+            None => exists,
+        });
         let mut summary = self.update_form.update.trim().to_string();
         if !cond.is_empty() {
             summary.push_str(&format!("  if  {cond}"));
@@ -2554,6 +3086,13 @@ impl App {
         })
     }
 
+    /// The update of all results waiting for its count to be typed.
+    pub fn pending_update(&self) -> Option<(&ddb::UpdateRequest, &[Item])> {
+        self.pending_update
+            .as_ref()
+            .map(|(req, keys)| (req, keys.as_slice()))
+    }
+
     /// How many items the open update form applies to.
     pub fn update_count(&self) -> usize {
         self.update_target
@@ -2561,13 +3100,38 @@ impl App {
             .map_or(0, |(_, keys, _)| keys.len())
     }
 
+    /// Updates `keys` a few at a time in the background, with a progress popup.
     fn update_many(&mut self, req: ddb::UpdateRequest, keys: Vec<Item>) {
+        if self.read_only() {
+            self.info(self.read_only_reason());
+            return;
+        }
         let Some(client) = self.client.clone() else {
             return;
         };
         self.screen = self.update_return;
-        self.progress(format!("Updating {} items…", keys.len()));
-        self.spawn(async move { Msg::UpdatedMany(ddb::update_items(&client, &req, keys).await) });
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.job = Some(Job {
+            kind: JobKind::Update {
+                req: Box::new(req.clone()),
+                progress: ddb::UpdateProgress {
+                    total: keys.len(),
+                    ..Default::default()
+                },
+            },
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        self.busy += 1;
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let progress_tx = tx.clone();
+            let report = ddb::update_items(&client, &req, keys, &cancel, move |p| {
+                let _ = progress_tx.send(Msg::UpdateProgress(p));
+            })
+            .await;
+            let _ = tx.send(Msg::UpdatedMany(report));
+        });
     }
 
     fn update(&mut self, req: ddb::UpdateRequest) {
@@ -2742,6 +3306,26 @@ impl App {
     }
 }
 
+/// The prompt that asks for the count of an update of all results.
+fn count_prompt() -> Prompt {
+    Prompt {
+        title: " Update all results ".into(),
+        text: String::new(),
+        action: PromptAction::ConfirmCount,
+        all: false,
+        scope: String::new(),
+    }
+}
+
+/// A key with what was read for it: the item, `None` when it is gone, or why it failed.
+type FreshItem = (Item, Result<Option<Item>, String>);
+
+/// Items an update confirmation previews.
+const PREVIEW_ITEMS: usize = 3;
+
+/// The name placeholder of the condition that keeps updates to existing items.
+const EXISTS_PLACEHOLDER: &str = "#ddbtuiexists";
+
 /// Adds the login command to SSO errors, which otherwise only say that the token expired or
 /// could not be loaded.
 fn login_hint(text: String, conn: Option<&Connection>) -> String {
@@ -2825,6 +3409,15 @@ fn placeholder(ty: &str) -> AttributeValue {
 fn fuzzy(text: &str, query: &str) -> bool {
     let mut rest = text.chars();
     query.chars().all(|q| rest.any(|c| c == q))
+}
+
+/// A scroll offset moved by `delta` lines, never below zero.
+fn scroll_by(offset: u16, delta: isize) -> u16 {
+    if delta > 0 {
+        offset.saturating_add(delta as u16)
+    } else {
+        offset.saturating_sub(delta.unsigned_abs() as u16)
+    }
 }
 
 fn step(selected: Option<usize>, len: usize, delta: isize) -> Option<usize> {
@@ -3653,6 +4246,113 @@ mod tests {
         assert_eq!(app.screen, Screen::Tables, "clicks elsewhere do nothing");
     }
 
+    /// An app on the update form for its first row, with the given update typed.
+    fn update_form_app(rt: &tokio::runtime::Runtime, rows: usize, update: &str) -> App {
+        let rows: Vec<Item> = (0..rows)
+            .map(|i| {
+                let mut it = item(&[("pk", "u")]);
+                it.insert("sk".into(), AttributeValue::N(i.to_string()));
+                it
+            })
+            .collect();
+        let mut app = table_app(rt, rows);
+        press(&mut app, KeyCode::Char('u'));
+        for c in update.chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app
+    }
+
+    fn row_key(i: usize) -> Item {
+        let mut k = item(&[("pk", "u")]);
+        k.insert("sk".into(), AttributeValue::N(i.to_string()));
+        k
+    }
+
+    #[test]
+    fn the_update_can_cover_the_whole_page() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = update_form_app(&rt, 4, "SET seen = true");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.update_form.field, UpdateField::Scope);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.update_form.scope, UpdateScope::Page);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.confirm, Some(Confirm::UpdateMany { keys, .. }) if keys.len() == 4));
+    }
+
+    #[test]
+    fn updating_all_results_needs_the_count_typed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = update_form_app(&rt, 2, "SET seen = true");
+        app.update_form.scope = UpdateScope::All;
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&app.confirm, Some(Confirm::CollectAll(_))),
+            "reading every key is confirmed first"
+        );
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.job,
+            Some(Job {
+                kind: JobKind::Collect { .. },
+                ..
+            })
+        ));
+        let found: Vec<Item> = (0..3).map(row_key).collect();
+        app.on_msg(Msg::Collected(Ok(Some(found))));
+        assert!(app.job.is_none());
+        assert!(matches!(&app.prompt, Some(p) if p.action == PromptAction::ConfirmCount));
+
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.job.is_none(), "a wrong count updates nothing");
+        assert!(matches!(&app.status, Status::Error(s) if s.contains("nothing was updated")));
+        assert!(
+            matches!(&app.prompt, Some(p) if p.action == PromptAction::ConfirmCount && p.text.is_empty()),
+            "the keys stay for another try"
+        );
+
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.job,
+            Some(Job {
+                kind: JobKind::Update { progress, .. },
+                ..
+            }) if progress.total == 3
+        ));
+    }
+
+    #[test]
+    fn the_result_retries_what_did_not_succeed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = update_form_app(&rt, 3, "SET seen = true");
+        let req = app.update_request().unwrap();
+        app.screen = Screen::Items;
+        app.batch_result = Some(BatchResult {
+            report: UpdateReport {
+                requested: 3,
+                updated: 1,
+                failed: vec![(row_key(1), "The condition was not met".into())],
+                skipped: vec![row_key(2)],
+                consumed: Some(1.0),
+            },
+            req,
+            secs: 0,
+            scroll: 0,
+        });
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.confirm.is_none(), "keys wait while the result shows");
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.batch_result.is_none());
+        let Some(Confirm::UpdateMany { keys, .. }) = &app.confirm else {
+            panic!("expected a retry confirmation")
+        };
+        assert_eq!(keys, &[row_key(1), row_key(2)]);
+    }
+
     #[test]
     fn marked_rows_share_one_update() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3678,6 +4378,44 @@ mod tests {
         assert_eq!((keys.len(), *hidden), (2, 0));
         assert_eq!(req.key, keys[0]);
         assert_eq!(req.update, "SET #n0 = :v0");
+        assert_eq!(
+            req.condition.as_deref(),
+            Some("attribute_exists(#ddbtuiexists)")
+        );
+    }
+
+    #[test]
+    fn the_preview_uses_fresh_reads_and_ignores_stale_ones() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = update_form_app(&rt, 2, "SET seen = 1");
+        press(&mut app, KeyCode::Enter);
+        let Some(Confirm::Update(req)) = &app.confirm else {
+            panic!("expected an update confirmation")
+        };
+        let req = req.clone();
+        assert!(app.update_preview(&req).is_none(), "still reading");
+
+        let mut fresh = row_key(0);
+        fresh.insert("seen".into(), AttributeValue::N("7".into()));
+        let id = app.preview_id;
+        app.on_msg(Msg::PreviewItems {
+            id: id - 1,
+            items: vec![(row_key(0), Ok(None))],
+        });
+        assert!(
+            app.update_preview(&req).is_none(),
+            "an earlier answer is dropped"
+        );
+        app.on_msg(Msg::PreviewItems {
+            id,
+            items: vec![(row_key(0), Ok(Some(fresh))), (row_key(1), Ok(None))],
+        });
+        let rows = app.update_preview(&req).unwrap();
+        let ItemPreview::Changes(changes) = &rows[0].1 else {
+            panic!("expected changes")
+        };
+        assert_eq!(changes[0].before, Some(AttributeValue::N("7".into())));
+        assert!(matches!(rows[1].1, ItemPreview::Gone));
     }
 
     #[test]
@@ -3700,7 +4438,12 @@ mod tests {
             panic!("expected an update confirmation")
         };
         assert_eq!(req.update, "SET #n0 = #n0 + :v0");
-        assert_eq!(req.condition.as_deref(), Some("attribute_exists(#n1)"));
+        assert_eq!(
+            req.condition.as_deref(),
+            Some("(attribute_exists(#n1)) AND attribute_exists(#ddbtuiexists)"),
+            "only items that still exist are updated"
+        );
+        assert_eq!(req.names["#ddbtuiexists"], "pk");
         assert_eq!(req.key.len(), 2, "pk and sk only");
         assert_eq!(req.values[":v0"], AttributeValue::N("1".into()));
     }
