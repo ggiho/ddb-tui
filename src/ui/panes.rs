@@ -225,6 +225,7 @@ pub(super) fn draw_launcher(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .highlight_style(theme::selected(app.palette.is_none() && !app.show_help))
         .highlight_symbol(Span::styled("▌ ", theme::fg(t.accent)));
+    app.hit.connections = list_area;
     f.render_stateful_widget(list, list_area, &mut app.conn_state);
     if empty {
         draw_centered(
@@ -324,6 +325,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let list = List::new(items)
         .highlight_style(theme::selected(focused))
         .highlight_symbol(Span::styled("▌ ", theme::fg(symbol)));
+    app.hit.tables = list_area;
     f.render_stateful_widget(list, list_area, &mut app.table_state);
     if empty {
         let lines = if app.filter.is_empty() {
@@ -670,6 +672,12 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         .row_highlight_style(theme::selected(focused))
         .cell_highlight_style(cell_style)
         .highlight_symbol(Text::from(Span::styled("▌", theme::fg(symbol))));
+    // Rows start below the header line.
+    app.hit.rows = Rect {
+        y: body.y + 1,
+        height: body.height.saturating_sub(1),
+        ..body
+    };
     f.render_stateful_widget(table, body, &mut app.item_state);
 }
 
@@ -816,5 +824,6 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         height: inner.height.saturating_sub(1),
         ..inner
     };
+    app.hit.detail = body;
     f.render_widget(Paragraph::new(lines).scroll((app.detail_scroll, 0)), body);
 }

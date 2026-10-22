@@ -23,6 +23,7 @@ use crate::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let t = theme::current();
+    app.hit = Default::default();
     f.render_widget(
         Block::new().style(Style::new().bg(t.bg).fg(t.text)),
         f.area(),

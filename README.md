@@ -44,6 +44,7 @@ ddb-tui                                     # AWS profiles from ~/.aws/config an
 ddb-tui --endpoint http://localhost:8000    # endpoint for the DynamoDB Local entry
 ddb-tui --theme catppuccin-latte            # tokyo-night (default), catppuccin-mocha, catppuccin-latte
 ddb-tui --read-only                         # no writes on any connection
+ddb-tui --no-mouse                          # leave the mouse to the terminal
 ```
 
 The connection list shows every profile with its region, account and credential type (read from
@@ -73,8 +74,10 @@ read_only = production                             # production (default), all o
 
 ## Keys
 
-Press `?` on any screen for its full key list, or `Ctrl+P` to search the commands. The most used
-ones:
+Press `?` on any screen for its full key list, or `Ctrl+P` to search the commands. The mouse
+works too: the wheel scrolls the list under it, a click selects and focuses, a double click
+opens. To select text with the mouse, hold Shift (Option in Terminal.app and iTerm2) or start with
+`--no-mouse`. The most used keys:
 
 | Screen | Keys |
 |---|---|

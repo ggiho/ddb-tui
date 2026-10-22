@@ -11,7 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedSender;
@@ -358,6 +361,24 @@ pub struct Prompt {
     pub scope: String,
 }
 
+/// Where the last drawing put the lists the mouse can click and scroll; empty when hidden.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HitAreas {
+    pub connections: Rect,
+    pub tables: Rect,
+    /// The item rows, below the grid's header.
+    pub rows: Rect,
+    pub detail: Rect,
+}
+
+/// The list a click landed in, for telling a double click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clicked {
+    Connection,
+    Table,
+    Row,
+}
+
 /// A whole-result export in progress; Esc sets `cancel`.
 pub struct ExportJob {
     pub path: String,
@@ -436,6 +457,9 @@ pub struct App {
     pub show_help: bool,
     pub palette: Option<Palette>,
     pub export_job: Option<ExportJob>,
+    /// Filled in by every drawing.
+    pub hit: HitAreas,
+    last_click: Option<(Instant, Clicked, usize)>,
     pub status: Status,
     status_at: Instant,
     /// Requests in flight; drives the loading indicator.
@@ -516,6 +540,8 @@ impl App {
             show_help: false,
             palette: None,
             export_job: None,
+            hit: HitAreas::default(),
+            last_click: None,
             status: Status::Info(String::new()),
             status_at: Instant::now(),
             busy: 0,
@@ -1142,6 +1168,94 @@ impl App {
             Screen::Update => self.key_update(key.code),
             Screen::Saved => self.key_saved(key.code),
         }
+    }
+
+    /// Scrolling moves the list under the pointer; a click selects a row, table or connection
+    /// and focuses its pane, and a double click opens it. Popups take no mouse input.
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        let popup = self.confirm.is_some()
+            || self.prompt.is_some()
+            || self.palette.is_some()
+            || self.show_help
+            || self.export_job.is_some()
+            || self.screen != self.base_screen();
+        if popup {
+            return;
+        }
+        let at = Position::new(m.column, m.row);
+        let hit = self.hit;
+        match m.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let delta = if m.kind == MouseEventKind::ScrollDown {
+                    3
+                } else {
+                    -3
+                };
+                if hit.rows.contains(at) {
+                    let n = self.visible_rows().len();
+                    self.item_state
+                        .select(step(self.item_state.selected(), n, delta));
+                } else if hit.tables.contains(at) {
+                    let n = self.visible_tables().len();
+                    self.table_state
+                        .select(step(self.table_state.selected(), n, delta));
+                } else if hit.connections.contains(at) {
+                    let n = self.visible_connections().len();
+                    self.conn_state
+                        .select(step(self.conn_state.selected(), n, delta));
+                } else if hit.detail.contains(at) {
+                    self.detail_scroll = if delta > 0 {
+                        self.detail_scroll.saturating_add(3)
+                    } else {
+                        self.detail_scroll.saturating_sub(3)
+                    };
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if hit.rows.contains(at) {
+                    let row = self.item_state.offset() + usize::from(at.y - hit.rows.y);
+                    if row < self.visible_rows().len() {
+                        self.item_state.select(Some(row));
+                        self.screen = Screen::Items;
+                        if self.double_click(Clicked::Row, row) {
+                            self.on_key(KeyEvent::from(KeyCode::Enter));
+                        }
+                    }
+                } else if hit.tables.contains(at) {
+                    let i = self.table_state.offset() + usize::from(at.y - hit.tables.y);
+                    if i < self.visible_tables().len() {
+                        self.table_state.select(Some(i));
+                        self.screen = Screen::Tables;
+                        if self.double_click(Clicked::Table, i) {
+                            self.on_key(KeyEvent::from(KeyCode::Enter));
+                        }
+                    }
+                } else if hit.connections.contains(at) {
+                    let i = self.conn_state.offset() + usize::from(at.y - hit.connections.y);
+                    if i < self.visible_connections().len() {
+                        self.conn_state.select(Some(i));
+                        if self.double_click(Clicked::Connection, i) {
+                            self.on_key(KeyEvent::from(KeyCode::Enter));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether this click repeats the last one on the same entry within half a second.
+    fn double_click(&mut self, list: Clicked, index: usize) -> bool {
+        let now = Instant::now();
+        let double = self.last_click.is_some_and(|(t, l, i)| {
+            l == list && i == index && now.duration_since(t) < Duration::from_millis(500)
+        });
+        self.last_click = if double {
+            None
+        } else {
+            Some((now, list, index))
+        };
+        double
     }
 
     fn key_palette(&mut self, code: KeyCode) {
@@ -3500,6 +3614,43 @@ mod tests {
         let labels: Vec<String> = app.palette_entries().into_iter().map(|e| e.label).collect();
         assert_eq!(labels[0], "open table Orders");
         assert!(!labels.iter().any(|l| l.contains("Users")));
+    }
+
+    #[test]
+    fn clicks_select_and_double_clicks_open() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rows: Vec<Item> = (0..5).map(|i| item(&[("pk", &i.to_string())])).collect();
+        let mut app = table_app(&rt, rows);
+        app.tables = vec!["a".into(), "t".into()];
+        app.hit.rows = Rect::new(30, 5, 60, 10);
+        app.hit.tables = Rect::new(0, 3, 24, 10);
+        let click = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.on_mouse(click(40, 7));
+        assert_eq!(app.item_state.selected(), Some(2), "third row");
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            ..click(40, 7)
+        });
+        assert_eq!(app.item_state.selected(), Some(4), "scrolled to the end");
+        app.on_mouse(click(40, 6));
+        app.on_mouse(click(40, 6));
+        assert_eq!(app.screen, Screen::Detail, "double click opens the item");
+
+        app.screen = Screen::Items;
+        app.on_mouse(click(5, 3));
+        assert_eq!(
+            (app.screen, app.table_state.selected()),
+            (Screen::Tables, Some(0)),
+            "clicking the table list focuses it"
+        );
+        app.on_mouse(click(90, 30));
+        assert_eq!(app.screen, Screen::Tables, "clicks elsewhere do nothing");
     }
 
     #[test]

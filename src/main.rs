@@ -11,7 +11,8 @@ use ddb_tui::item::{self, Item};
 use ddb_tui::{profiles, settings, theme, ui};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -20,38 +21,49 @@ use tokio::sync::mpsc::UnboundedReceiver;
 const DEFAULT_LOCAL_ENDPOINT: &str = "http://localhost:8000";
 
 fn main() -> Result<()> {
-    let (endpoint, read_only) = parse_args()?;
+    let args = parse_args()?;
     let rt = tokio::runtime::Runtime::new()?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut connections: Vec<Connection> = profiles::profile_names()
         .into_iter()
         .map(Connection::Profile)
         .collect();
-    connections.push(Connection::Local(endpoint));
+    connections.push(Connection::Local(args.endpoint));
     let mut app = App::new(connections, rt.handle().clone(), tx);
     app.profile_info = profiles::profile_info();
     app.settings = settings::load();
-    app.force_read_only = read_only;
+    app.force_read_only = args.read_only;
 
     let mut terminal = ratatui::init();
     // Pastes arrive as one event, so a newline in pasted text cannot press Enter.
     let _ = execute!(stdout(), EnableBracketedPaste);
-    let result = run(&mut terminal, &mut app, &mut rx);
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    if args.mouse {
+        let _ = execute!(stdout(), EnableMouseCapture);
+    }
+    let result = run(&mut terminal, &mut app, &mut rx, args.mouse);
+    let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
     result
 }
 
+struct Args {
+    endpoint: String,
+    read_only: bool,
+    mouse: bool,
+}
+
 /// Reads the arguments and selects the theme: `--theme`, else the one chosen last time.
-fn parse_args() -> Result<(String, bool)> {
+fn parse_args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
     let mut endpoint = DEFAULT_LOCAL_ENDPOINT.to_string();
     let mut read_only = false;
+    let mut mouse = true;
     theme::load_saved();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--endpoint" => endpoint = args.next().context("--endpoint needs a URL")?,
             "--read-only" => read_only = true,
+            "--no-mouse" => mouse = false,
             "--theme" => {
                 let name = args.next().context("--theme needs a name")?;
                 ensure!(
@@ -62,7 +74,7 @@ fn parse_args() -> Result<(String, bool)> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: ddb-tui [--endpoint URL] [--theme NAME] [--read-only]\n\n  --endpoint URL  DynamoDB Local endpoint (default {DEFAULT_LOCAL_ENDPOINT})\n  --theme NAME    {} (T switches while running)\n  --read-only     no writes on any connection; W cannot allow them",
+                    "usage: ddb-tui [--endpoint URL] [--theme NAME] [--read-only] [--no-mouse]\n\n  --endpoint URL  DynamoDB Local endpoint (default {DEFAULT_LOCAL_ENDPOINT})\n  --theme NAME    {} (T switches while running)\n  --read-only     no writes on any connection; W cannot allow them\n  --no-mouse      leave the mouse to the terminal, for selecting text",
                     theme::NAMES.join(", ")
                 );
                 std::process::exit(0);
@@ -70,13 +82,18 @@ fn parse_args() -> Result<(String, bool)> {
             other => bail!("unknown argument: {other} (see --help)"),
         }
     }
-    Ok((endpoint, read_only))
+    Ok(Args {
+        endpoint,
+        read_only,
+        mouse,
+    })
 }
 
 fn run(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     rx: &mut UnboundedReceiver<Msg>,
+    mouse: bool,
 ) -> Result<()> {
     // The screen is redrawn after input and responses; otherwise only to animate the loading
     // spinner and, once a second, to let toasts expire. An idle screen then costs nothing.
@@ -101,17 +118,21 @@ fn run(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
                 Event::Paste(text) => app.on_paste(&text),
+                Event::Mouse(m) => app.on_mouse(m),
                 _ => {}
             }
             // Resizes and focus changes need a redraw too.
             dirty = true;
         }
         if let Some(item) = app.take_edit_request() {
-            let _ = execute!(stdout(), DisableBracketedPaste);
+            let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
             ratatui::restore();
             let result = edit_in_editor(&item);
             enable_raw_mode()?;
             execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+            if mouse {
+                execute!(stdout(), EnableMouseCapture)?;
+            }
             terminal.clear()?;
             app.on_edited(item, result);
             dirty = true;
