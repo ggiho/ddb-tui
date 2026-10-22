@@ -207,7 +207,9 @@ const ITEMS_KEYS: &[Binding] = &[
     bind("o", "saved operations", KeyCode::Char('o')),
     bind("t", "table details", KeyCode::Char('t')),
     hint("+ / -", "page size"),
-    hint("←→ / hl", "columns"),
+    hint("←→ / hl", "move between cells"),
+    bind("v", "copy the cell value", KeyCode::Char('v')),
+    bind("g", "query by the cell value", KeyCode::Char('g')),
     bind("s", "plain scan", KeyCode::Char('s')),
     bind("x", "PartiQL", KeyCode::Char('x')),
     bind("r", "refresh page", KeyCode::Char('r')),
@@ -388,8 +390,11 @@ pub struct App {
     pub request: Option<ReadRequest>,
     pub pager: Pager,
     pub item_state: TableState,
-    /// Horizontal scroll over the non-key columns; key columns stay pinned on the left.
+    /// Horizontal scroll over the non-key columns; key columns stay pinned on the left. The
+    /// drawing keeps it following `col_cursor`.
     pub col_offset: usize,
+    /// The column of the cell cursor, an index into `columns()`.
+    pub col_cursor: usize,
     pub page_size: usize,
     /// Rows of the current page marked for delete or export.
     pub marked: BTreeSet<usize>,
@@ -474,6 +479,7 @@ impl App {
             pager: Pager::default(),
             item_state: TableState::default(),
             col_offset: 0,
+            col_cursor: 0,
             page_size: PAGE_SIZES[1],
             marked: BTreeSet::new(),
             detail: None,
@@ -1474,14 +1480,15 @@ impl App {
                     .select(step(self.item_state.selected(), n, 1))
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.col_offset = self.col_offset.saturating_sub(1)
+                self.col_cursor = self.col_cursor.saturating_sub(1)
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                let (cols, keys) = self.columns();
-                if self.col_offset + 1 < cols.len() - keys {
-                    self.col_offset += 1;
+                if self.col_cursor + 1 < self.columns().0.len() {
+                    self.col_cursor += 1;
                 }
             }
+            KeyCode::Char('v') => self.copy_cell(),
+            KeyCode::Char('g') => self.query_by_cell(),
             KeyCode::Char('n') | KeyCode::Char(']') => self.next_page(),
             KeyCode::Char('p') | KeyCode::Char('[') => self.prev_page(),
             KeyCode::Char(' ') => self.toggle_mark(),
@@ -1804,6 +1811,7 @@ impl App {
         self.marked.clear();
         self.item_state.select(None);
         self.col_offset = 0;
+        self.col_cursor = 0;
         self.fetch(None, false);
     }
 
@@ -2084,6 +2092,63 @@ impl App {
         };
         self.progress(format!("Deleting {} item(s)…", keys.len()));
         self.spawn(async move { Msg::Deleted(ddb::delete_items(&client, &table, keys).await) });
+    }
+
+    /// The column under the cell cursor and the selected item's value in it.
+    fn cursor_cell(&self) -> Option<(String, Option<&AttributeValue>)> {
+        let (cols, _) = self.columns();
+        let column = cols
+            .get(self.col_cursor.min(cols.len().checked_sub(1)?))?
+            .clone();
+        let value = self.selected_item()?.get(&column);
+        Some((column, value))
+    }
+
+    fn copy_cell(&mut self) {
+        match self.cursor_cell() {
+            Some((_, Some(value))) => self.clipboard = Some(item::text(value)),
+            Some((column, None)) => self.info(format!("This item has no {column}")),
+            None => {}
+        }
+    }
+
+    /// Queries by the value under the cursor: the index whose partition key is that column
+    /// (the table first), or else the selected item's partition in the table.
+    fn query_by_cell(&mut self) {
+        let Some((column, _)) = self.cursor_cell() else {
+            return;
+        };
+        let Some(info) = self
+            .table
+            .clone()
+            .filter(|t| Some(t.name.as_str()) == self.request_table().as_deref())
+        else {
+            self.info("Query needs the table's key schema; open the table first");
+            return;
+        };
+        let (index, key) = match info.indexes.iter().position(|i| i.pk.name == column) {
+            Some(i) => (i, column),
+            None => (0, info.base().pk.name.clone()),
+        };
+        let value = self
+            .selected_item()
+            .and_then(|it| it.get(&key))
+            .and_then(key_text);
+        let Some(value) = value else {
+            self.info(format!("This item has no {key} to query by"));
+            return;
+        };
+        let mut form = ReadForm::default();
+        form.index = index;
+        form.pk = value;
+        self.form = form;
+        match self.form.request(&info) {
+            Ok(req) => {
+                self.last_form = Some(self.form.clone());
+                self.start_read(req);
+            }
+            Err(e) => self.error(e),
+        }
     }
 
     fn copy(&mut self, item: Option<Item>, plain: bool) {
@@ -2552,6 +2617,15 @@ fn complete_into(names: &BTreeSet<String>, field: &mut String, hint: &mut Vec<St
     }
 }
 
+/// A key value as the read form takes it: strings and numbers as-is, binary as base64.
+fn key_text(v: &AttributeValue) -> Option<String> {
+    match v {
+        AttributeValue::S(s) | AttributeValue::N(s) => Some(s.clone()),
+        AttributeValue::B(_) => Some(item::text(v).trim_matches('"').to_string()),
+        _ => None,
+    }
+}
+
 fn wcu(units: Option<f64>) -> String {
     units.map(|u| format!(" · {u} WCU")).unwrap_or_default()
 }
@@ -2965,15 +3039,51 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_scroll_covers_only_non_key_columns() {
+    fn the_cell_cursor_stays_on_the_columns() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut row = item(&[("pk", "a"), ("x", "1"), ("y", "2")]);
         row.insert("sk".into(), AttributeValue::N("1".into()));
         let mut app = table_app(&rt, vec![row]);
-        for _ in 0..5 {
+        for _ in 0..9 {
             press(&mut app, KeyCode::Right);
         }
-        assert_eq!(app.col_offset, 1, "two non-key columns allow one step");
+        assert_eq!(app.col_cursor, 3, "pk, sk, x, y");
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.take_clipboard().as_deref(), Some("2"), "the y cell");
+        for _ in 0..9 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.col_cursor, 0);
+    }
+
+    #[test]
+    fn g_queries_by_the_cell_value() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut row = item(&[("pk", "user#1"), ("type", "gold"), ("note", "x")]);
+        row.insert("sk".into(), AttributeValue::N("1".into()));
+        let mut app = table_app(&rt, vec![row]);
+        app.col_cursor = app.columns().0.iter().position(|c| c == "type").unwrap();
+        press(&mut app, KeyCode::Char('g'));
+        let Some(ReadRequest::Query { index, pk, .. }) = &app.request else {
+            panic!("expected a query")
+        };
+        assert_eq!(
+            index.as_deref(),
+            Some("by_type"),
+            "type is that index's partition key"
+        );
+        assert_eq!(pk.1, AttributeValue::S("gold".into()));
+
+        let mut row = item(&[("pk", "user#1"), ("note", "x")]);
+        row.insert("sk".into(), AttributeValue::N("1".into()));
+        let mut app = table_app(&rt, vec![row]);
+        app.col_cursor = app.columns().0.iter().position(|c| c == "note").unwrap();
+        press(&mut app, KeyCode::Char('g'));
+        let Some(ReadRequest::Query { index, pk, .. }) = &app.request else {
+            panic!("expected a query")
+        };
+        assert_eq!(index, &None, "other columns query the item's partition");
+        assert_eq!(pk, &("pk".to_string(), AttributeValue::S("user#1".into())));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Cell, List, ListItem, Paragraph, Row, Table};
 use unicode_width::UnicodeWidthStr;
@@ -545,26 +545,47 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         })
         .collect();
 
-    // Key columns stay pinned; the rest scroll horizontally from the offset.
+    // Key columns stay pinned; the rest scroll horizontally from the offset, which follows
+    // the cell cursor.
     let marking = !app.marked.is_empty();
     let avail = (body.width as usize).saturating_sub(1 + if marking { 3 } else { 0 });
-    let start = keys + app.col_offset.min(cols.len().saturating_sub(keys + 1));
-    let mut visible: Vec<usize> = (0..keys).collect();
-    let mut used: usize = visible.iter().map(|&i| widths[i] + COL_GAP as usize).sum();
-    for (i, w) in widths.iter().enumerate().skip(start) {
-        if visible.len() > keys && used + w > avail {
-            break;
+    let window = |offset: usize| {
+        let start = keys + offset.min(cols.len().saturating_sub(keys + 1));
+        let mut visible: Vec<usize> = (0..keys).collect();
+        let mut used: usize = visible.iter().map(|&i| widths[i] + COL_GAP as usize).sum();
+        for (i, w) in widths.iter().enumerate().skip(start) {
+            if visible.len() > keys && used + w > avail {
+                break;
+            }
+            used += w + COL_GAP as usize;
+            visible.push(i);
         }
-        used += w + COL_GAP as usize;
-        visible.push(i);
+        (start, visible)
+    };
+    let cursor = app.col_cursor.min(cols.len() - 1);
+    if cursor >= keys {
+        app.col_offset = app.col_offset.min(cursor - keys);
+        while !window(app.col_offset).1.contains(&cursor) {
+            app.col_offset += 1;
+        }
     }
+    let (start, visible) = window(app.col_offset);
+    let marker = usize::from(marking);
+    app.item_state.select_column(
+        visible
+            .iter()
+            .position(|&c| c == cursor)
+            .map(|p| p + marker),
+    );
 
     let mut header_cells: Vec<Cell> = Vec::new();
     if marking {
         header_cells.push(Cell::from(""));
     }
     header_cells.extend(visible.iter().map(|&c| {
-        let style = if c < keys {
+        let style = if c == cursor && focused {
+            theme::bold(t.accent).add_modifier(Modifier::UNDERLINED)
+        } else if c < keys {
             theme::bold(t.key)
         } else {
             theme::bold(t.subtext)
@@ -638,10 +659,16 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     draw_pager(f, app, pager, scrolled);
 
     let symbol = if focused { t.accent } else { t.muted };
+    let cell_style = if focused {
+        theme::pill(t.on_accent, t.accent)
+    } else {
+        Style::new()
+    };
     let table = Table::new(table_rows, constraints)
         .header(header)
         .column_spacing(COL_GAP)
         .row_highlight_style(theme::selected(focused))
+        .cell_highlight_style(cell_style)
         .highlight_symbol(Text::from(Span::styled("▌", theme::fg(symbol))));
     f.render_stateful_widget(table, body, &mut app.item_state);
 }
