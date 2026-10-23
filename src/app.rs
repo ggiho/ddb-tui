@@ -2060,11 +2060,7 @@ impl App {
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.generation += 1;
-                self.screen = if self.is_partiql() {
-                    Screen::PartiQL
-                } else {
-                    Screen::Tables
-                };
+                self.screen = Screen::Tables;
             }
             _ => {}
         }
@@ -3786,6 +3782,33 @@ mod tests {
             press(&mut app, KeyCode::Char(key));
         }
         assert_eq!(app.busy, 1, "refresh and page size never run it again");
+    }
+
+    #[test]
+    fn partiql_results_go_back_to_the_tables_and_x_edits_the_statement() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = table_app(&rt, Vec::new());
+            app.screen = Screen::PartiQL;
+            app.partiql = "SELECT * FROM \"t\"".into();
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen, Screen::Items);
+            press(&mut app, key);
+            assert_eq!(
+                app.screen,
+                Screen::Tables,
+                "{key:?} leaves like a Scan result"
+            );
+        }
+        let mut app = table_app(&rt, Vec::new());
+        app.screen = Screen::PartiQL;
+        app.partiql = "SELECT * FROM \"t\"".into();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.screen, Screen::PartiQL);
+        assert_eq!(app.partiql, "SELECT * FROM \"t\"", "the statement is kept");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Items, "and Esc returns to its result");
     }
 
     #[test]
