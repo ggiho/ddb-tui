@@ -33,9 +33,9 @@ Prebuilt binaries for macOS (Apple silicon, Intel) and Linux (x86_64, arm64) are
 [releases page](https://github.com/ggiho/ddb-tui/releases), each with a `.sha256` file:
 
 ```sh
-curl -LO https://github.com/ggiho/ddb-tui/releases/download/v0.3.0/ddb-tui-v0.3.0-aarch64-apple-darwin.tar.gz
-tar xzf ddb-tui-v0.3.0-aarch64-apple-darwin.tar.gz
-./ddb-tui-v0.3.0-aarch64-apple-darwin/ddb-tui
+curl -LO https://github.com/ggiho/ddb-tui/releases/download/v0.3.1/ddb-tui-v0.3.1-aarch64-apple-darwin.tar.gz
+tar xzf ddb-tui-v0.3.1-aarch64-apple-darwin.tar.gz
+./ddb-tui-v0.3.1-aarch64-apple-darwin/ddb-tui
 ```
 
 A file downloaded with a browser on macOS is quarantined; `xattr -d com.apple.quarantine ddb-tui`
