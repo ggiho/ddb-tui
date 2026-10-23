@@ -15,8 +15,8 @@ A fast terminal UI for Amazon DynamoDB.
   automatically.
 - Scan/Query with filters, projections, consistent reads, sort order and secondary indexes,
   written in DynamoDB's own expression syntax.
-- Edit items in `$EDITOR`, create, duplicate, delete (one or many) and run UpdateItem
-  expressions, all behind a confirmation.
+- Edit items in `$VISUAL` or `$EDITOR` (otherwise nvim when installed, else vi), create,
+  duplicate, delete (one or many) and run UpdateItem expressions, all behind a confirmation.
 - PartiQL, table details (keys, the attributes seen on the loaded page, indexes, capacity,
   deletion protection, encryption, TTL, point-in-time recovery, tags), consumed capacity per page
   and the requests behind it.

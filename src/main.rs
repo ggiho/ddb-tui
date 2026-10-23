@@ -172,14 +172,15 @@ fn copy_to_clipboard(text: &str) -> Result<&'static str> {
     Ok("terminal OSC 52")
 }
 
-/// Opens the item as DynamoDB JSON in $VISUAL/$EDITOR. `Ok(None)` means nothing changed.
+/// Opens the item as DynamoDB JSON in $VISUAL/$EDITOR, else nvim when installed, else vi.
+/// `Ok(None)` means nothing changed.
 fn edit_in_editor(item: &Item) -> Result<Option<Item>> {
     let original = serde_json::to_string_pretty(&item::item_to_json(item))?;
     let path = std::env::temp_dir().join(format!("ddb-tui-{}.json", std::process::id()));
     write_private(&path, &original)?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
+        .unwrap_or_else(|_| if on_path("nvim") { "nvim" } else { "vi" }.into());
     // Through sh so editors with arguments ("code -w") work.
     let status = Command::new("sh")
         .arg("-c")
@@ -196,6 +197,11 @@ fn edit_in_editor(item: &Item) -> Result<Option<Item>> {
         serde_json::from_str(&edited?).context("edited item is not valid JSON")?;
     let edited = item::item_from_json(&value)?;
     Ok((edited != *item).then_some(edited))
+}
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 /// The temp file holds table data, so only the current user may read it.
