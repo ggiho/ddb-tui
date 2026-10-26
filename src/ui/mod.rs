@@ -41,7 +41,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         panes::draw_workspace(f, app, body);
     }
+    // A confirmation, prompt, job or result replaces the popup screen it came from rather
+    // than stacking on it.
+    let covered = app.confirm.is_some()
+        || app.prompt.is_some()
+        || app.job.is_some()
+        || app.batch_result.is_some();
     match app.screen {
+        _ if covered => {}
         Screen::Form => popups::draw_form(f, app, body),
         Screen::Update => popups::draw_update(f, app, body),
         Screen::PartiQL => popups::draw_partiql(f, app, body),
@@ -380,23 +387,20 @@ fn fit(s: &str, typing: bool, width: usize) -> String {
     }
 }
 
-/// Clears the popup area plus one column on each side, painted in the theme background. A
-/// double-width character (Korean, CJK) cut by the popup edge would otherwise swallow the
-/// border cell next to it.
+/// Clears the popup area. A double-width character (Korean, CJK) that starts just left of the
+/// popup would still cover its first column, so such a character becomes a space; one that
+/// starts inside is cleared with the popup.
 fn clear_popup(f: &mut Frame, popup: Rect) {
-    let screen = f.area();
-    let x = popup.x.saturating_sub(1).max(screen.x);
-    let right = (popup.x + popup.width + 1).min(screen.x + screen.width);
-    let area = Rect {
-        x,
-        width: right.saturating_sub(x),
-        ..popup
-    };
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Block::new().style(Style::new().bg(theme::current().bg)),
-        area,
-    );
+    f.render_widget(Clear, popup);
+    if popup.x > f.area().x {
+        let buf = f.buffer_mut();
+        for y in popup.top()..popup.bottom() {
+            let cell = &mut buf[(popup.x - 1, y)];
+            if cell.symbol().width() > 1 {
+                cell.set_symbol(" ");
+            }
+        }
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -717,6 +721,88 @@ mod tests {
                 "{arrow} past a long key name"
             );
         }
+    }
+
+    #[test]
+    fn a_wide_character_at_a_popup_edge_does_not_cover_it() {
+        let mut term = Terminal::new(TestBackend::new(10, 3)).unwrap();
+        term.draw(|f| {
+            f.render_widget(Paragraph::new("가나다라마"), f.area());
+            // Starts in the middle of 나 (columns 2 and 3).
+            clear_popup(f, Rect::new(3, 0, 4, 3));
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(2, 0)].symbol(), " ", "나 would cover the first column");
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "가",
+            "characters clear of the edge stay"
+        );
+        assert_eq!(
+            buf[(1, 0)].symbol(),
+            " ",
+            "and nothing beside the popup is painted"
+        );
+    }
+
+    #[test]
+    fn a_confirmation_replaces_the_popup_it_came_from() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = sample_app(&rt);
+        app.screen = Screen::Update;
+        assert!(render(&mut app, 120, 34).contains("UpdateItem"));
+        app.confirm = Some(Confirm::AllowWrites);
+        let covered = render(&mut app, 120, 34);
+        assert!(covered.contains("Allow writes"));
+        assert!(
+            !covered.contains("UpdateItem"),
+            "not stacked under the confirmation"
+        );
+    }
+
+    #[test]
+    fn update_results_name_each_reason_once() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = sample_app(&rt);
+        app.screen = Screen::Items;
+        let key = |i: usize| Item::from([("pk".to_string(), AttributeValue::S(format!("u{i}")))]);
+        let why = "The condition was not met";
+        app.batch_result = Some(crate::app::BatchResult {
+            report: crate::ddb::UpdateReport {
+                requested: 4,
+                updated: 0,
+                failed: (0..3).map(|i| (key(i), why.to_string())).collect(),
+                skipped: vec![key(3)],
+                consumed: None,
+            },
+            req: crate::ddb::UpdateRequest {
+                table: "Demo".into(),
+                key: key(0),
+                update: String::new(),
+                condition: None,
+                names: Default::default(),
+                values: Default::default(),
+                summary: "SET seen = 1".into(),
+            },
+            secs: 0,
+            scroll: 0,
+        });
+        let screen = render(&mut app, 120, 34);
+        assert_eq!(screen.matches(why).count(), 1);
+        assert!(screen.contains("· 3 items") && screen.contains("not sent  · 1 item"));
+        assert!(screen.contains(r#"{"pk":"u2"}"#) && screen.contains(r#"{"pk":"u3"}"#));
+    }
+
+    #[test]
+    fn the_production_note_says_how_writes_start() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = sample_app(&rt);
+        app.screen = Screen::Connections;
+        app.conn_state.select(Some(0));
+        assert!(render(&mut app, 120, 30).contains("starts read-only · W allows writes"));
+        app.settings.read_only = crate::settings::ReadOnly::None;
+        assert!(render(&mut app, 120, 30).contains("every write asks for confirmation first"));
     }
 
     #[test]

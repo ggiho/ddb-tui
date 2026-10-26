@@ -125,9 +125,10 @@ fn run(
             dirty = true;
         }
         if let Some(item) = app.take_edit_request() {
+            let keys = app.key_names();
             let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
             ratatui::restore();
-            let result = edit_in_editor(&item);
+            let result = edit_in_editor(&item, &keys);
             enable_raw_mode()?;
             execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
             if mouse {
@@ -172,10 +173,10 @@ fn copy_to_clipboard(text: &str) -> Result<&'static str> {
     Ok("terminal OSC 52")
 }
 
-/// Opens the item as DynamoDB JSON in $VISUAL/$EDITOR, else nvim when installed, else vi.
-/// `Ok(None)` means nothing changed.
-fn edit_in_editor(item: &Item) -> Result<Option<Item>> {
-    let original = serde_json::to_string_pretty(&item::item_to_json(item))?;
+/// Opens the item as DynamoDB JSON, its `keys` first, in $VISUAL/$EDITOR, else nvim when
+/// installed, else vi. `Ok(None)` means nothing changed.
+fn edit_in_editor(item: &Item, keys: &[String]) -> Result<Option<Item>> {
+    let original = item::pretty_keys_first(&item::item_to_json(item), keys);
     let path = std::env::temp_dir().join(format!("ddb-tui-{}.json", std::process::id()));
     write_private(&path, &original)?;
     let editor = std::env::var("VISUAL")

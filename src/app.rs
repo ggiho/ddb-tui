@@ -938,6 +938,13 @@ impl App {
     /// Column names and how many leading ones are key attributes: the table's keys, then the
     /// read index's keys, then everything else alphabetically. Keys a projection left out of
     /// every item are skipped.
+    /// The key attributes of the current read, in the order the grid shows them.
+    pub fn key_names(&self) -> Vec<String> {
+        let (mut cols, keys) = self.columns();
+        cols.truncate(keys);
+        cols
+    }
+
     pub fn columns(&self) -> (Vec<String>, usize) {
         let mut cols: Vec<String> = Vec::new();
         if let (Some(t), Some(req)) = (&self.table, &self.request)
@@ -1143,8 +1150,10 @@ impl App {
                         self.info("Export cancelled; the partial file was removed")
                     }
                     Ok(s) => self.ok(format!(
-                        "Exported {} items to {path} · {} RCU · {secs} s",
-                        s.progress.items, s.progress.consumed
+                        "Exported {} items to {} · {} RCU · {secs} s",
+                        s.progress.items,
+                        tilde(&path),
+                        s.progress.consumed
                     )),
                     Err(e) => self.error(format!("Export failed, nothing kept: {e:#}")),
                 }
@@ -1241,8 +1250,8 @@ impl App {
                 }
                 if report.failed.is_empty() {
                     self.ok(format!(
-                        "Deleted {} item(s){}",
-                        report.deleted,
+                        "Deleted {}{}",
+                        plural(report.deleted, "item"),
                         wcu(report.consumed)
                     ));
                 } else {
@@ -1578,7 +1587,15 @@ impl App {
         match code {
             KeyCode::Up | KeyCode::Char('k') => result.scroll = result.scroll.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                let rows = result.report.failed.len() + result.report.skipped.len();
+                // As the result lists them: a heading per reason and for those not sent.
+                let r = &result.report;
+                let rows = r.failures_by_reason().len()
+                    + r.failed.len()
+                    + if r.skipped.is_empty() {
+                        0
+                    } else {
+                        1 + r.skipped.len()
+                    };
                 result.scroll = (result.scroll + 1).min(rows.saturating_sub(1));
             }
             KeyCode::Char('r') => {
@@ -1664,7 +1681,7 @@ impl App {
         !self.writes_allowed
     }
 
-    fn starts_read_only(&self, conn: &Connection) -> bool {
+    pub fn starts_read_only(&self, conn: &Connection) -> bool {
         self.force_read_only
             || match self.settings.read_only {
                 ReadOnly::All => true,
@@ -2445,7 +2462,7 @@ impl App {
             (item::item_to_json(item), "DynamoDB JSON")
         };
         self.detail_title = format!(" Item · {style} ");
-        self.detail_text = serde_json::to_string_pretty(&json).unwrap_or_default();
+        self.detail_text = item::pretty_keys_first(&json, &self.key_names());
     }
 
     /// Moves through `PAGE_SIZES` and restarts the read, since cached pages had the old size.
@@ -2479,9 +2496,9 @@ impl App {
             return;
         };
         self.detail_title = format!(
-            " Page {} · {} call(s) · request and response metadata ",
+            " Page {} · {} · request and response metadata ",
             self.pager.number(),
-            page.calls.len()
+            plural(page.calls.len(), "call")
         );
         self.detail_text = serde_json::to_string_pretty(&page.calls).unwrap_or_default();
         self.detail_kind = DetailKind::Json;
@@ -2594,7 +2611,7 @@ impl App {
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.progress(format!("Deleting {} item(s)…", keys.len()));
+        self.progress(format!("Deleting {}…", plural(keys.len(), "item")));
         self.spawn(async move { Msg::Deleted(ddb::delete_items(&client, &table, keys).await) });
     }
 
@@ -2689,6 +2706,11 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // `20261023T020412Z`: readable, sorts by time, and says it is UTC.
+        let stamp = aws_sdk_dynamodb::primitives::DateTime::from_secs(secs as i64)
+            .fmt(aws_sdk_dynamodb::primitives::DateTimeFormat::DateTime)
+            .unwrap_or_default()
+            .replace(['-', ':'], "");
         let what = if self.marked.is_empty() {
             format!("page {} ({n} items)", self.pager.number())
         } else {
@@ -2696,7 +2718,7 @@ impl App {
         };
         self.prompt = Some(Prompt {
             title: " Export · .csv, .json or .jsonl ".into(),
-            text: format!("{name}-{secs}.csv"),
+            text: format!("{name}-{stamp}.csv"),
             action: PromptAction::Export,
             all: false,
             scope: what,
@@ -3154,7 +3176,7 @@ impl App {
         };
         self.saved = saved::list(&dir);
         if self.saved.is_empty() {
-            self.info(format!("No saved operations in {}", dir.display()));
+            self.info(format!("No saved operations in {}", tilde(dir.display())));
             return;
         }
         self.saved_state.select(Some(0));
@@ -3265,7 +3287,7 @@ impl App {
             None => return,
         };
         match result {
-            Ok(path) => self.ok(format!("Saved to {}", path.display())),
+            Ok(path) => self.ok(format!("Saved to {}", tilde(path.display()))),
             Err(e) => self.error(e),
         }
     }
@@ -3274,7 +3296,7 @@ impl App {
         let rows = self.export_rows();
         let (columns, _) = self.columns();
         match export::export(Path::new(path), &columns, &rows) {
-            Ok(()) => self.ok(format!("Exported {} items to {path}", rows.len())),
+            Ok(()) => self.ok(format!("Exported {} items to {}", rows.len(), tilde(path))),
             Err(e) => self.error(e),
         }
     }
@@ -3299,6 +3321,26 @@ impl App {
     fn set_status(&mut self, status: Status) {
         self.status = status;
         self.status_at = Instant::now();
+    }
+}
+
+/// `1 item`, `3 items`.
+pub fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// A path with the home directory shown as `~`.
+fn tilde(path: impl std::fmt::Display) -> String {
+    let path = path.to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && (path == home || path.starts_with(&format!("{home}/"))) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path,
     }
 }
 

@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{centered, clear_popup, fit};
 use crate::app::{
-    App, Click, Confirm, ItemPreview, JobKind, PromptAction, UpdateField, UpdateScope,
+    App, Click, Confirm, ItemPreview, JobKind, PromptAction, UpdateField, UpdateScope, plural,
 };
 use crate::ddb::{self, SkOp};
 use crate::form::Field;
@@ -778,11 +778,12 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
             keys,
             hidden,
         }) => {
+            let what = match keys.len() {
+                1 => "this item".to_string(),
+                n => format!("{n} items"),
+            };
             let mut lines = vec![Line::styled(
-                format!(
-                    " Delete {} item(s) from {table}? This cannot be undone.",
-                    keys.len()
-                ),
+                format!(" Delete {what} from {table}? This cannot be undone."),
                 theme::bold(t.err),
             )];
             for key in keys.iter().take(5) {
@@ -879,6 +880,7 @@ pub(super) fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
                     theme::fg(t.warn),
                 ));
             }
+            lines.push(Line::raw(""));
             lines.push(hint(&format!(
                 "Sent {} at a time; a failure does not stop the rest.",
                 ddb::UPDATE_CONCURRENCY
@@ -1139,7 +1141,10 @@ pub(super) fn draw_batch_result(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = vec![
         Line::raw(""),
         Line::from(vec![
-            Span::styled(format!(" ✔ {} updated", r.updated), theme::bold(t.ok)),
+            Span::styled(
+                format!(" ✔ {} updated", r.updated),
+                theme::bold(if r.updated == 0 { t.muted } else { t.ok }),
+            ),
             Span::styled(
                 format!("    ✖ {} failed", r.failed.len()),
                 theme::bold(if r.failed.is_empty() { t.muted } else { t.err }),
@@ -1164,29 +1169,39 @@ pub(super) fn draw_batch_result(f: &mut Frame, app: &mut App, area: Rect) {
         ]),
         Line::styled(format!("   {}", result.req.summary), theme::muted()),
     ];
-    let mut rows: Vec<Line> = Vec::new();
-    for (key, why) in &r.failed {
-        rows.push(Line::from(vec![
-            Span::styled("   ✖ ", theme::fg(t.err)),
-            Span::styled(
-                fit(&item::item_to_plain_json(key).to_string(), false, 40),
-                theme::fg(t.text),
+    // Each reason once, with the keys it applies to below it; the scroll in the app counts
+    // these lines the same way.
+    let key_line = |key: &item::Item| {
+        Line::styled(
+            format!(
+                "       {}",
+                fit(
+                    &item::item_to_plain_json(key).to_string(),
+                    false,
+                    (width as usize).saturating_sub(10)
+                )
             ),
+            theme::fg(t.text),
+        )
+    };
+    let heading = |icon: &'static str, color, why: &str, n: usize| {
+        Line::from(vec![
+            Span::styled(format!("   {icon} "), theme::fg(color)),
             Span::styled(
-                format!("  {}", fit(why, false, (width as usize).saturating_sub(52))),
+                fit(why, false, (width as usize).saturating_sub(20)),
                 theme::fg(t.subtext),
             ),
-        ]));
+            Span::styled(format!("  · {}", plural(n, "item")), theme::bold(color)),
+        ])
+    };
+    let mut rows: Vec<Line> = Vec::new();
+    for (why, keys) in r.failures_by_reason() {
+        rows.push(heading("✖", t.err, why, keys.len()));
+        rows.extend(keys.into_iter().map(key_line));
     }
-    for key in &r.skipped {
-        rows.push(Line::from(vec![
-            Span::styled("   ◌ ", theme::fg(t.warn)),
-            Span::styled(
-                fit(&item::item_to_plain_json(key).to_string(), false, 40),
-                theme::fg(t.text),
-            ),
-            Span::styled("  not sent", theme::muted()),
-        ]));
+    if !r.skipped.is_empty() {
+        rows.push(heading("◌", t.warn, "not sent", r.skipped.len()));
+        rows.extend(r.skipped.iter().map(key_line));
     }
     let room = (area.height as usize).saturating_sub(12).max(3);
     if !rows.is_empty() {

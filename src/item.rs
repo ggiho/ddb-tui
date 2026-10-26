@@ -110,6 +110,32 @@ fn plain(v: &AttributeValue) -> Value {
 }
 
 /// Plain JSON (`{"name": "x", "n": 1}`) for copying into code or documents.
+/// Pretty JSON of an item with the `first` attributes (its keys) on top and the rest in name
+/// order, the way the grid shows them.
+pub fn pretty_keys_first(json: &Value, first: &[String]) -> String {
+    let Value::Object(map) = json else {
+        return serde_json::to_string_pretty(json).unwrap_or_default();
+    };
+    if map.is_empty() {
+        return "{}".into();
+    }
+    let entries = first
+        .iter()
+        .filter_map(|k| map.get_key_value(k))
+        .chain(map.iter().filter(|(k, _)| !first.contains(k)));
+    let fields: Vec<String> = entries
+        .map(|(k, v)| {
+            let value = serde_json::to_string_pretty(v).unwrap_or_default();
+            format!(
+                "  {}: {}",
+                Value::String(k.clone()),
+                value.replace('\n', "\n  ")
+            )
+        })
+        .collect();
+    format!("{{\n{}\n}}", fields.join(",\n"))
+}
+
 pub fn item_to_plain_json(item: &Item) -> Value {
     Value::Object(item.iter().map(|(k, v)| (k.clone(), plain(v))).collect())
 }
@@ -168,6 +194,19 @@ pub fn scalar(ty: &str, text: &str) -> Result<AttributeValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pretty_json_puts_the_keys_first() {
+        let json = serde_json::json!({"a": 1, "pk": "x", "sk": {"N": "2"}, "z": [1, 2]});
+        let text = pretty_keys_first(&json, &["pk".into(), "sk".into()]);
+        assert_eq!(
+            text,
+            "{\n  \"pk\": \"x\",\n  \"sk\": {\n    \"N\": \"2\"\n  },\n  \"a\": 1,\n  \"z\": [\n    1,\n    2\n  ]\n}"
+        );
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, json, "the same JSON");
+        assert_eq!(pretty_keys_first(&serde_json::json!({}), &[]), "{}");
+    }
 
     fn sample() -> Item {
         let nested = Item::from([("inner".to_string(), AttributeValue::N("1.50".into()))]);

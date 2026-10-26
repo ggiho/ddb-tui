@@ -802,6 +802,20 @@ pub struct UpdateReport {
     pub consumed: Option<f64>,
 }
 
+impl UpdateReport {
+    /// The failed items grouped by why, in the order the reasons first came up.
+    pub fn failures_by_reason(&self) -> Vec<(&str, Vec<&Item>)> {
+        let mut groups: Vec<(&str, Vec<&Item>)> = Vec::new();
+        for (item, why) in &self.failed {
+            match groups.iter_mut().find(|(w, _)| *w == why.as_str()) {
+                Some((_, items)) => items.push(item),
+                None => groups.push((why, vec![item])),
+            }
+        }
+        groups
+    }
+}
+
 /// Requests in flight at once while updating many items.
 pub const UPDATE_CONCURRENCY: usize = 8;
 

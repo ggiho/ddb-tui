@@ -257,7 +257,7 @@ fn catppuccin_latte(c: &impl Fn(u32) -> Color) -> Theme {
         name: NAMES[2],
         bg: c(0xdce0e8),
         surface: c(0xeff1f5),
-        raised: c(0xe6e9ef),
+        raised: c(0xffffff),
         select: c(0xccd0da),
         select_dim: c(0xe1e4ea),
         border: c(0xbcc0cc),

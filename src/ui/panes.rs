@@ -18,6 +18,8 @@ use crate::{highlight, theme};
 
 const MAX_COL_WIDTH: usize = 36;
 const COL_GAP: u16 = 2;
+/// The narrowest cut-off column worth showing in the space left at the grid's right edge.
+const MIN_PEEK: usize = 6;
 
 /// Tables on the left, the grid in the middle and the selected item on the right. Narrow
 /// terminals drop the preview first, then the table list unless it has focus.
@@ -227,6 +229,25 @@ pub(super) fn draw_launcher(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(Span::styled("▌ ", theme::fg(t.accent)));
     app.hit.connections = list_area;
     f.render_stateful_widget(list, list_area, &mut app.conn_state);
+    // The selection band paints over the badge's own background; put it back.
+    if let Some(row) = app
+        .conn_state
+        .selected()
+        .and_then(|s| s.checked_sub(app.conn_state.offset()))
+        && (row as u16) < list_area.height
+        && matches!(app.selected_connection(), Some(Connection::Profile(n)) if app.is_production_profile(n))
+    {
+        let badge = theme::production(" ● prod ");
+        // After the selection mark, the name column and the two-space gap.
+        let x = list_area.x + 2 + name_w.saturating_sub(badge_slot) as u16 + 2;
+        let area = Rect {
+            x,
+            y: list_area.y + row as u16,
+            width: (badge.width() as u16).min(list_area.right().saturating_sub(x)),
+            height: 1,
+        };
+        f.render_widget(badge, area);
+    }
     if empty {
         draw_centered(
             f,
@@ -243,14 +264,18 @@ pub(super) fn draw_launcher(f: &mut Frame, app: &mut App, area: Rect) {
         Some(Connection::Profile(name)) if app.is_production_profile(name)
     );
     if selected_prod {
+        let behavior = match app.selected_connection() {
+            _ if app.force_read_only => "read-only: started with --read-only",
+            Some(conn) if app.starts_read_only(conn) => {
+                "starts read-only · W allows writes for the session"
+            }
+            _ => "every write asks for confirmation first",
+        };
         f.render_widget(
             Line::from(vec![
                 Span::styled("● ", theme::fg(t.err)),
                 Span::styled("Production account", theme::bold(t.err)),
-                Span::styled(
-                    "  ·  every write asks for confirmation first",
-                    theme::fg(t.subtext),
-                ),
+                Span::styled(format!("  ·  {behavior}"), theme::fg(t.subtext)),
             ]),
             note,
         );
@@ -571,7 +596,17 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             app.col_offset += 1;
         }
     }
-    let (start, visible) = window(app.col_offset);
+    let (start, mut visible) = window(app.col_offset);
+    let full = *visible.last().expect("at least one column");
+    // Space left over shows the start of the next column rather than staying empty. It is not
+    // where the cell cursor goes: moving onto it scrolls it fully into view.
+    let mut widths = widths;
+    let used: usize = visible.iter().map(|&c| widths[c] + COL_GAP as usize).sum();
+    let left = avail.saturating_sub(used);
+    if full + 1 < cols.len() && left >= MIN_PEEK {
+        widths[full + 1] = widths[full + 1].min(left);
+        visible.push(full + 1);
+    }
     let marker = usize::from(marking);
     // Where the table puts each column: after the one-cell selection mark and the marker
     // column, separated by the column gap.
@@ -604,7 +639,7 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         } else {
             theme::bold(t.subtext)
         };
-        let line = Line::styled(cols[c].clone(), style);
+        let line = Line::styled(fit(&cols[c], false, widths[c]), style);
         Cell::from(if numeric[c] {
             line.right_aligned()
         } else {
@@ -667,9 +702,8 @@ fn draw_grid(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             .iter()
             .map(|&c| Constraint::Length(widths[c] as u16)),
     );
-    let last = *visible.last().expect("at least one column");
     let scrolled =
-        (start > keys || last + 1 < cols.len()).then_some((start + 1, last + 1, cols.len()));
+        (start > keys || full + 1 < cols.len()).then_some((start + 1, full + 1, cols.len()));
     draw_pager(f, app, pager, scrolled);
 
     let symbol = if focused { t.accent } else { t.muted };
