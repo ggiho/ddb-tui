@@ -38,7 +38,9 @@ jobs:
         run: |
           name="ddb-tui-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/ddb-tui" README.md LICENSE "$name/"
+          cp "target/${{ matrix.target }}/release/ddb-tui" \
+             "target/${{ matrix.target }}/release/sql-viewer" \
+             README.md SQL_VIEWER.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4

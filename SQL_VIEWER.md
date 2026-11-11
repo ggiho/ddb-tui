@@ -4,7 +4,13 @@
 Ratatui stack and themes; its table model is independent of DynamoDB.
 It never connects to a database. The mycli and pgcli forks need no source changes.
 
-Build and install on macOS:
+The macOS and Linux release archives include both `ddb-tui` and `sql-viewer`.
+With the ggiho dotfiles, `chezmoi init --apply ggiho` (new Mac) or `chezmoi update`
+(existing Mac) installs the binaries and configures the pager automatically; no
+Rust toolchain is needed. See the dotfiles README for the full bootstrap command.
+
+Build and install from source on macOS:
+
 
 ```sh
 cargo build --bin sql-viewer
@@ -16,11 +22,11 @@ In both `~/.myclirc` and `~/.config/pgcli/config`, set:
 
 ```ini
 table_format = ascii_escaped
-pager = /Users/giho.seong/.local/libexec/sql-pager/viewer
+pager = $HOME/.local/libexec/sql-pager/viewer
 enable_pager = True
 ```
 
-Use your own absolute home path when installing elsewhere. Restart the CLI to
+The pager command expands `$HOME` through the shell. Restart the CLI to
 load these settings. Keep the existing `sql-pager/less` wrapper beside `viewer`.
 A result fitting both screen dimensions prints directly; larger results open the
 grid. Zero-row tables stay in the CLI screen regardless of width or
