@@ -30,7 +30,7 @@
 - Tradeoff: long values wrap and can require scrolling; do not shorten other fields because another cell is selected.
 
 ## Visual language
-- Color: existing role-based themes; terminal default background remains visible.
+- Color: existing role-based themes; terminal default background remains visible. Unselected rows share one background; only selection is highlighted.
 - Typography: terminal monospace, bold accent-colored column names with colons, normal indented values, a marker for the selected field.
 - Layout: one-column inner padding, one blank line between groups, thin rules.
 - Shape: inspector rounded outer frame; no nested boxes. No animation or images.

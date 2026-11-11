@@ -67,9 +67,8 @@ Columns have one space of padding on each side, thin vertical separators, and
 one horizontal rule under the header. Long headers and values end in `…` only
 when clipped; clipping respects display widths (including Korean text). Copy and
 search still use the complete displayed value, without the visual ellipsis.
-Alternating rows use a subtle theme-matched background across cells, separators,
-and unused grid space. Bands follow the row position while scrolling. The selected
-row and cell use stronger highlighting. Press `d` to hide/show details without losing selection.
+All unselected rows use the same background; thin column separators provide
+boundaries. The selected row and cell remain highlighted. Press `d` to hide/show details without losing selection.
 Details start enabled for each result and remain automatically hidden below 80
 columns. The toggle is local to the current result.
 

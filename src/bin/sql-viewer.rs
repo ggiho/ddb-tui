@@ -577,21 +577,13 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.row >= app.top + app.page {
         app.top = app.row + 1 - app.page;
     }
-    // Paint the whole row, including separators and unused space, so the band
-    // remains continuous. Absolute row parity keeps it stable while scrolling.
-    for r in app.top..(app.top + app.grid.height as usize).min(app.data.rows.len()) {
-        let background = if r == app.row {
-            t.select
-        } else if r % 2 == 1 {
-            t.select_dim
-        } else {
-            t.bg
-        };
+    // Keep the selected row continuous across separators and unused space.
+    if app.row >= app.top && app.row < app.top + app.grid.height as usize {
         f.render_widget(
-            Block::default().style(Style::new().bg(background)),
+            Block::default().style(Style::new().bg(t.select)),
             Rect::new(
                 app.grid.x,
-                app.grid.y + (r - app.top) as u16,
+                app.grid.y + (app.row - app.top) as u16,
                 app.grid.width,
                 1,
             ),
@@ -905,7 +897,7 @@ mod tests {
         assert_eq!(a.page, a.grid.height as usize);
     }
     #[test]
-    fn row_bands_cover_gaps_and_remain_stable_when_scrolling() {
+    fn only_the_selected_row_has_a_background() {
         let mut a = app();
         a.data.rows = (0..12)
             .map(|i| vec![i.to_string(), "value".into()])
@@ -921,7 +913,7 @@ mod tests {
         let last = a.grid.right() - 1;
         let buffer = terminal.backend().buffer();
         for column in [x, x + 1, separator, separator + 1, last] {
-            assert_eq!(buffer[(column, y + 1)].bg, colors.select_dim);
+            assert_eq!(buffer[(column, y + 1)].bg, colors.bg);
             assert_eq!(buffer[(column, y + 2)].bg, colors.bg);
         }
         assert_eq!(buffer[(x + 1, y + 4)].bg, colors.accent);
@@ -930,7 +922,7 @@ mod tests {
         a.move_row(1);
         terminal.draw(|f| draw(f, &mut a)).unwrap();
         assert_eq!(a.top, 1);
-        assert_eq!(terminal.backend().buffer()[(x, y)].bg, colors.select_dim);
+        assert_eq!(terminal.backend().buffer()[(x, y)].bg, colors.bg);
     }
     #[test]
     fn record_fields_keep_order_and_full_values_when_selection_changes() {
