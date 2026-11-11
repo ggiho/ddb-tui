@@ -87,6 +87,7 @@ fn save_theme(path: Option<&std::path::Path>, name: &str) -> io::Result<()> {
 struct App {
     data: SqlTable,
     selected_theme: usize,
+    toggle_prefix: bool,
     row: usize,
     col: usize,
     top: usize,
@@ -128,6 +129,7 @@ impl App {
             widths,
             data,
             selected_theme: 0,
+            toggle_prefix: false,
             row: 0,
             col: 0,
             top: 0,
@@ -147,6 +149,32 @@ impl App {
             grid: Rect::default(),
             page: 1,
         }
+    }
+    fn view_state(&self) -> serde_json::Value {
+        serde_json::json!({"row":self.row,"col":self.col,"top":self.top,"left":self.left,
+            "search":self.search,"sorted":self.sorted,"descending":self.descending,
+            "details_scroll":self.details_scroll,"show_details":self.show_details})
+    }
+    fn restore_view(&mut self, state: &serde_json::Value) {
+        let index = |name: &str| state[name].as_u64().and_then(|n| usize::try_from(n).ok());
+        if let Some(col) = index("sorted").filter(|c| *c < self.data.headers.len()) {
+            self.col = col;
+            self.sorted = Some(col);
+            self.descending = !state["descending"].as_bool().unwrap_or(false);
+            self.sort();
+        }
+        self.row = index("row")
+            .unwrap_or(0)
+            .min(self.data.rows.len().saturating_sub(1));
+        self.col = index("col")
+            .unwrap_or(0)
+            .min(self.data.headers.len().saturating_sub(1));
+        self.top = index("top").unwrap_or(0).min(self.row);
+        self.left = index("left").unwrap_or(0).min(self.col);
+        self.search = state["search"].as_str().unwrap_or("").to_owned();
+        self.details_scroll = index("details_scroll").unwrap_or(0).min(u16::MAX as usize) as u16;
+        self.show_details = state["show_details"].as_bool().unwrap_or(true);
+        self.notice.clear();
     }
     fn apply_theme(&mut self, index: usize) {
         self.selected_theme = index;
@@ -313,6 +341,17 @@ impl App {
         };
     }
     fn key(&mut self, key: event::KeyEvent) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.toggle_prefix {
+            self.toggle_prefix = false;
+            if control && key.code == KeyCode::Char('v') {
+                return true;
+            }
+        }
+        if control && key.code == KeyCode::Char('x') {
+            self.toggle_prefix = true;
+            return false;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
         }
@@ -542,7 +581,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         title,
     );
     if app.help {
-        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\n/  Search · Enter to find · n/N next/previous\ns  Sort selected column, toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
+        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\n/  Search · Enter to find · n/N next/previous\ns  Sort selected column, toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nCtrl+X Ctrl+V  Return to query input\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
         return;
     }
     let (grid, details) = if app.show_details && body.width >= 80 {
@@ -690,7 +729,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {message}\n hjkl move  v cell  y row  / search  s sort  d details  T theme  ? help  q quit"
+            " {message}\n hjkl move  v cell  y row  / search  s sort  d details  T theme  ^X ^V query  q quit"
         ))
         .style(theme::fg(t.subtext)),
         status,
@@ -706,9 +745,19 @@ impl Drop for Restore {
 fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, / search, s sort, d details, T theme (saved), q quit.\nExit 2: unsupported input; caller should use a text pager."
+            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, / search, s sort, d details, T theme (saved), Ctrl+X Ctrl+V query, q quit.\nExit 2: unsupported input; caller should use a text pager."
         );
         return Ok(());
+    }
+    let mut args = std::env::args().skip(1);
+    let mut view_path = None;
+    while let Some(arg) = args.next() {
+        if arg == "--view-state" {
+            view_path =
+                Some(std::path::PathBuf::from(args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--view-state needs a path")
+                })?));
+        }
     }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -741,6 +790,13 @@ fn main() -> Result<()> {
     }
     let mut app = App::new(data);
     app.apply_theme(load_theme(theme_path().as_deref()));
+    if let Some(state) = view_path
+        .as_ref()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    {
+        app.restore_view(&state);
+    }
     let mut terminal = ratatui::try_init()?;
     let _restore = Restore;
     // ratatui restores raw mode on panic; also release mouse capture.
@@ -760,6 +816,17 @@ fn main() -> Result<()> {
             }
             Event::Mouse(m) => app.on_mouse(m),
             _ => {}
+        }
+    }
+    drop(_restore);
+    if let Some(path) = view_path {
+        let staged = path.with_extension("json.new");
+        let saved = (|| -> io::Result<()> {
+            std::fs::write(&staged, app.view_state().to_string())?;
+            std::fs::rename(&staged, &path)
+        })();
+        if let Err(error) = saved {
+            eprintln!("Could not save result position: {error}");
         }
     }
     Ok(())
@@ -829,6 +896,29 @@ mod tests {
         a.top = 0;
         a.key(ctrl('d'));
         assert_eq!((a.row, a.top), (0, 0));
+    }
+    #[test]
+    fn resume_restores_sorted_selection_search_and_panel_position() {
+        let mut original = app();
+        original.sort();
+        original.row = 1;
+        original.col = 1;
+        original.search = "서울".into();
+        original.show_details = false;
+        original.details_scroll = 7;
+        let state = original.view_state();
+        let mut reopened = app();
+        reopened.restore_view(&state);
+        assert_eq!(reopened.data.rows, original.data.rows);
+        assert_eq!((reopened.row, reopened.col), (1, 1));
+        assert_eq!(reopened.search, "서울");
+        assert!(!reopened.show_details);
+        assert_eq!(reopened.details_scroll, 7);
+        reopened.restore_view(&serde_json::json!({"row":999999,"col":999999,"sorted":999999}));
+        assert_eq!((reopened.row, reopened.col), (1, 1));
+        let ctrl = |c| event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(!reopened.key(ctrl('x')));
+        assert!(reopened.key(ctrl('v')));
     }
     #[test]
     fn decimal_sort_is_exact() {

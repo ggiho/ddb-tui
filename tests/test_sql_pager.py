@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 import io
+import os
+import tempfile
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts/sql-pager"
 loader = importlib.machinery.SourceFileLoader("pager", str(SCRIPT))
@@ -49,6 +51,41 @@ class PagerTests(unittest.TestCase):
              patch.object(pager, 'run', side_effect=[FileNotFoundError(), 0]) as run:
             self.assertEqual(pager.main(), 0)
             self.assertEqual(run.call_args.args[1], data)
+
+    def test_session_cache_replaces_last_result_and_resets_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = pathlib.Path(folder)
+            with patch.dict(os.environ, SQL_VIEWER_SESSION=folder):
+                self.assertEqual(pager.session_directory(), directory)
+            pager.remember(directory, b'first result')
+            (directory / 'view.json').write_text('{"row":3}')
+            pager.remember(directory, b'next result')
+            self.assertEqual((directory / 'result').read_bytes(), b'next result')
+            self.assertFalse((directory / 'view.json').exists())
+            with patch.object(pager, 'MAX_CACHE_BYTES', 1):
+                pager.remember(directory, b'too large')
+            self.assertFalse((directory / 'result').exists())
+
+    def test_resume_uses_saved_bytes_and_bypasses_size_check(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = pathlib.Path(folder)
+            pager.remember(directory, b'saved result')
+            with patch.dict(os.environ, SQL_VIEWER_SESSION=folder), \
+                 patch.object(pager.sys, 'argv', ['viewer', '--resume']), \
+                 patch.object(pager.sys, 'stdin', SimpleNamespace(buffer=None)), \
+                 patch.object(pager.os, 'get_terminal_size', return_value=(100, 100)), \
+                 patch.object(pager, 'run', return_value=0) as run:
+                self.assertEqual(pager.main(), 0)
+                self.assertEqual(run.call_args.args[1], b'saved result')
+                self.assertIn('--view-state', run.call_args.args[0])
+
+    def test_sessions_do_not_leak_and_public_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            pager.remember(pathlib.Path(first), b'first connection')
+            self.assertFalse((pathlib.Path(second) / 'result').exists())
+            pathlib.Path(second).chmod(0o755)
+            with patch.dict(os.environ, SQL_VIEWER_SESSION=second):
+                self.assertIsNone(pager.session_directory())
 
 
 if __name__ == "__main__":

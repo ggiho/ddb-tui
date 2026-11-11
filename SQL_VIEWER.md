@@ -52,7 +52,22 @@ failure go to the existing less wrapper with the original bytes.
 | `[`, `]` | Scroll right-hand record details |
 | `T` | Cycle theme and save the selection |
 | `?` | Help |
+| `Ctrl+X`, `Ctrl+V` | Return to query input; the same chord in the CLI reopens results |
 | `q`, Escape | Close help or exit |
+
+With the updated mycli/pgcli forks, **Ctrl+X then Ctrl+V** switches between
+query input and the last displayed result. The CLI draft and cursor stay intact.
+Reopening reads a cached result without executing SQL and restores the selected
+cell, viewport, search, sort and details-panel position. A new displayed result
+replaces that cache and starts a fresh view. Small inline results can also be
+reopened; empty results continue to print inline.
+
+The cache is private to each CLI process (including concurrent connections),
+stored in its mode-0700 temporary directory, and removed on normal process exit.
+Results above 64 MiB are not cached; an oversized result clears the old cache
+instead of reopening stale data. The shortcut is enabled only for this custom
+pager and a compatible viewer. Other pagers retain their bindings. Restart the
+CLI after updating the forks. Existing mycli `\last` remains available separately.
 
 The default `terminal` theme uses the terminal's background, foreground, and ANSI
 palette. In your WezTerm this follows the custom Catppuccin Mocha colors, including
