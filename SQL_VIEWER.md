@@ -52,10 +52,10 @@ failure go to the existing less wrapper with the original bytes.
 | `[`, `]` | Scroll right-hand record details |
 | `T` | Cycle theme and save the selection |
 | `?` | Help |
-| `Ctrl+X`, `Ctrl+V` | Return to query input; the same chord in the CLI reopens results |
+| `Ctrl+G` | Return to query input; the same key in the CLI reopens results |
 | `q`, Escape | Close help or exit |
 
-With the updated mycli/pgcli forks, **Ctrl+X then Ctrl+V** switches between
+With the updated mycli/pgcli forks, **Ctrl+G** switches between
 query input and the last displayed result. The CLI draft and cursor stay intact.
 Reopening reads a cached result without executing SQL and restores the selected
 cell, viewport, search, sort and details-panel position. A new displayed result

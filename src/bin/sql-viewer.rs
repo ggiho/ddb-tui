@@ -87,7 +87,6 @@ fn save_theme(path: Option<&std::path::Path>, name: &str) -> io::Result<()> {
 struct App {
     data: SqlTable,
     selected_theme: usize,
-    toggle_prefix: bool,
     row: usize,
     col: usize,
     top: usize,
@@ -129,7 +128,6 @@ impl App {
             widths,
             data,
             selected_theme: 0,
-            toggle_prefix: false,
             row: 0,
             col: 0,
             top: 0,
@@ -342,15 +340,8 @@ impl App {
     }
     fn key(&mut self, key: event::KeyEvent) -> bool {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        if self.toggle_prefix {
-            self.toggle_prefix = false;
-            if control && key.code == KeyCode::Char('v') {
-                return true;
-            }
-        }
-        if control && key.code == KeyCode::Char('x') {
-            self.toggle_prefix = true;
-            return false;
+        if control && key.code == KeyCode::Char('g') {
+            return true;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
@@ -581,7 +572,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         title,
     );
     if app.help {
-        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\n/  Search · Enter to find · n/N next/previous\ns  Sort selected column, toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nCtrl+X Ctrl+V  Return to query input\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
+        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\n/  Search · Enter to find · n/N next/previous\ns  Sort selected column, toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nCtrl+G  Return to query input\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
         return;
     }
     let (grid, details) = if app.show_details && body.width >= 80 {
@@ -729,7 +720,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {message}\n hjkl move  v cell  y row  / search  s sort  d details  T theme  ^X ^V query  q quit"
+            " {message}\n hjkl move  v cell  y row  / search  s sort  d details  T theme  ^G query  q quit"
         ))
         .style(theme::fg(t.subtext)),
         status,
@@ -745,7 +736,7 @@ impl Drop for Restore {
 fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, / search, s sort, d details, T theme (saved), Ctrl+X Ctrl+V query, q quit.\nExit 2: unsupported input; caller should use a text pager."
+            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, / search, s sort, d details, T theme (saved), Ctrl+G query, q quit.\nIntegration: --view-state PATH restores session state.\nExit 2: unsupported input; caller should use a text pager."
         );
         return Ok(());
     }
@@ -917,8 +908,7 @@ mod tests {
         reopened.restore_view(&serde_json::json!({"row":999999,"col":999999,"sorted":999999}));
         assert_eq!((reopened.row, reopened.col), (1, 1));
         let ctrl = |c| event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        assert!(!reopened.key(ctrl('x')));
-        assert!(reopened.key(ctrl('v')));
+        assert!(reopened.key(ctrl('g')));
     }
     #[test]
     fn decimal_sort_is_exact() {

@@ -20,7 +20,7 @@
 - Jobs: scan results, read long values and JSON, copy a cell or row.
 
 ## Information architecture
-- Grid is primary; right-hand inspector follows its selection. Ctrl+X then Ctrl+V switches between the existing CLI prompt and cached results, preserving both states without SQL execution.
+- Grid is primary; right-hand inspector follows its selection. Ctrl+G switches between the existing CLI prompt and cached results, preserving both states without SQL execution.
 - Record-panel hierarchy: record position → every column name and full value in query order → persistent actions and scroll position.
 
 ## Design principles
