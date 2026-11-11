@@ -52,21 +52,17 @@ failure go to the existing less wrapper with the original bytes.
 | `[`, `]` | Scroll right-hand record details |
 | `T` | Cycle theme and save the selection |
 | `?` | Help |
-| `Alt+T` | Return to query input; the same key in the CLI reopens results |
 | `q`, Escape | Close help or exit |
 
-With the updated mycli/pgcli forks, **Alt+T** switches between
-query input and the last displayed result. The CLI draft and cursor stay intact.
-Reopening reads a cached result without executing SQL and restores the selected
-cell, viewport, search, sort and details-panel position. A new displayed result
-replaces that cache and starts a fresh view. Small inline results can also be
-reopened; empty results continue to print inline.
+No result-toggle shortcut is assigned. Select a key with the user before adding
+any CLI, viewer, terminal or multiplexer binding. `q` / Escape return to the CLI.
+The session cache and viewer-state support remain available for a future explicit
+binding; cached results can be reopened without SQL execution.
 
 The cache is private to each CLI process (including concurrent connections),
 stored in its mode-0700 temporary directory, and removed on normal process exit.
 Results above 64 MiB are not cached; an oversized result clears the old cache
-instead of reopening stale data. The shortcut is enabled only for this custom
-pager and a compatible viewer. Other pagers retain their bindings. Restart the
+instead of reopening stale data. The cache integration requires this custom pager and a compatible viewer. Restart the
 CLI after updating the forks. Existing mycli `\last` remains available separately.
 
 The default `terminal` theme uses the terminal's background, foreground, and ANSI
