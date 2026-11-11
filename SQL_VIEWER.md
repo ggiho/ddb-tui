@@ -22,11 +22,12 @@ In both `~/.myclirc` and `~/.config/pgcli/config`, set:
 
 ```ini
 table_format = ascii_escaped
-pager = $HOME/.local/libexec/sql-pager/viewer
+pager = /bin/sh -c 'exec "$HOME/.local/libexec/sql-pager/viewer"'
 enable_pager = True
 ```
 
-The pager command expands `$HOME` through the shell. Restart the CLI to
+The explicit `/bin/sh` expands `$HOME`, including with Click versions that execute
+the pager directly without a shell. Restart the CLI to
 load these settings. Keep the existing `sql-pager/less` wrapper beside `viewer`.
 A result fitting both screen dimensions prints directly; larger results open the
 grid. Zero-row tables stay in the CLI screen regardless of width or
