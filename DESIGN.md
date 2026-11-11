@@ -20,7 +20,7 @@
 - Jobs: scan results, read long values and JSON, copy a cell or row.
 
 ## Information architecture
-- Grid is primary; right-hand inspector follows its selection. Ctrl+G switches between the existing CLI prompt and cached results, preserving both states without SQL execution.
+- Grid is primary; right-hand inspector follows its selection. Alt+T switches between the existing CLI prompt and cached results, preserving both states without SQL execution.
 - Record-panel hierarchy: record position → every column name and full value in query order → persistent actions and scroll position.
 
 ## Design principles
@@ -44,6 +44,7 @@
 - Keyboard: hjkl selects cells; [ and ] scroll; d hides inspector; v/y copy.
 - Selection is signaled by labels and emphasis, not color alone.
 - Mouse wheel over inspector scrolls details, elsewhere scrolls grid; field clicks select that column without changing the scroll position.
+- Shortcut routing: Alt+T avoids the Kanata A-hold Ctrl layer (G becomes Home) and active tmux Alt+V copy-mode binding. Check live terminal/multiplexer mappings before choosing replacement keys.
 - No motion. Terminal screen-reader behavior is not certified.
 
 ## Responsive behavior
