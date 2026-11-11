@@ -2,6 +2,8 @@
 
 A fast terminal UI for Amazon DynamoDB.
 
+The optional [SQL result viewer](SQL_VIEWER.md) also serves local mycli/pgcli forks.
+
 - One workspace: the table list, the item grid and the selected item side by side. Narrow
   terminals fold the outer panes away.
 - Values read by type: numbers right-aligned, nested maps and lists folded into `{3}` and `[2]`,

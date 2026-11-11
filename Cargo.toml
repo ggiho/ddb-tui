@@ -1,5 +1,6 @@
 [package]
 name = "ddb-tui"
+default-run = "ddb-tui"
 version = "0.3.2"
 edition = "2024"
 description = "A fast terminal UI for Amazon DynamoDB"

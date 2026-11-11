@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Use sql-viewer for supported large tables, preserving the text pager fallback."""
+import os
+import re
+import signal
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+SGR = re.compile(r"\x1b\[[0-9;:]*m")
+
+
+def width(text):
+    column = 0
+    for char in SGR.sub("", text):
+        if char == "\t":
+            column += 8 - column % 8
+        elif not unicodedata.combining(char) and not unicodedata.category(char).startswith("C"):
+            column += 2 if unicodedata.east_asian_width(char) in "WF" else 1
+    return column
+
+
+def fits(data, columns, rows):
+    lines = data.decode("utf-8", "replace").splitlines()
+    return len(lines) < rows and all(width(line) <= columns for line in lines)
+
+
+def run(command, data):
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        child = subprocess.Popen(command, stdin=subprocess.PIPE)
+        child.communicate(data)
+        return child.returncode
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def main():
+    data = sys.stdin.buffer.read()
+    try:
+        columns, rows = os.get_terminal_size(sys.stdout.fileno())
+    except OSError:
+        sys.stdout.buffer.write(data)
+        return 0
+    if os.environ.get("SQL_VIEWER_ALWAYS") != "1" and fits(data, columns, rows):
+        sys.stdout.buffer.write(data)
+        return 0
+    binary = Path.home() / ".local/bin/sql-viewer"
+    try:
+        status = run([str(binary), "--escaped"], data)
+    except OSError:
+        status = 127
+    if status == 0:
+        return 0
+    # The original bytes reach less even if parsing, initialization or rendering fails.
+    if status != 2:
+        print(f"(sql-viewer exited {status}; using text pager)", file=sys.stderr)
+    fallback = Path(__file__).resolve().with_name("less")
+    if fallback.is_file():
+        return run([str(fallback)], data)
+    return run(["/usr/bin/less", "-R", "-S"], data)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

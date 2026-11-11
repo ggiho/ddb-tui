@@ -356,7 +356,7 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// Fits text into `width` columns: while typing the end stays visible, otherwise the start.
-fn fit(s: &str, typing: bool, width: usize) -> String {
+pub fn fit(s: &str, typing: bool, width: usize) -> String {
     let s = if typing {
         format!("{s}▏")
     } else {

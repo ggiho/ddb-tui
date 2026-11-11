@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 
+#[derive(Clone)]
 pub struct Theme {
     pub name: &'static str,
     /// Behind the panes: the top bar, the footer and the gaps between panes.

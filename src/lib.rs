@@ -14,3 +14,5 @@ pub mod saved;
 pub mod settings;
 pub mod theme;
 pub mod ui;
+
+pub mod sql_table;
