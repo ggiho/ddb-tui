@@ -48,7 +48,7 @@ failure go to the existing less wrapper with the original bytes.
 | `Ctrl+D`, `Ctrl+U` | Move grid down / up half a visible page (Vim style) |
 | `v` | Copy displayed cell using `pbcopy` |
 | `y` | Copy displayed row as TSV |
-| `/`, Enter | Search all cells, case insensitive |
+| `f` or `/`, Enter | Search all cells, case insensitive |
 | `n`, `N` | Next / previous match |
 | `s` | Sort selected column, toggle ascending / descending |
 | `d` | Toggle record details; hide to give the grid the full width |

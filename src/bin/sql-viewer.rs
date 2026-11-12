@@ -400,7 +400,9 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.move_row(self.data.rows.len() as isize),
             KeyCode::PageDown => self.move_row(self.page as isize),
             KeyCode::PageUp => self.move_row(-(self.page as isize)),
-            KeyCode::Char('/') => {
+            KeyCode::Char('/') | KeyCode::Char('f')
+                if key.code == KeyCode::Char('/') || key.modifiers.is_empty() =>
+            {
                 self.editing = true;
                 self.search.clear();
             }
@@ -570,7 +572,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         title,
     );
     if app.help {
-        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\n/  Search · Enter to find · n/N next/previous\ns  Sort selected column, toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nCtrl+T  Return to query input\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
+        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\nf or /  Search · Enter to find · n/N next/previous\ns  Sort selected column, toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nCtrl+T  Return to query input\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
         return;
     }
     let (grid, details) = if app.show_details && body.width >= 80 {
@@ -718,7 +720,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {message}\n hjkl move  v cell  y row  / search  s sort  d details  T theme  ^T query  q quit"
+            " {message}\n hjkl move  v cell  y row  f,/ search  s sort  d details  T theme  ^T query  q quit"
         ))
         .style(theme::fg(t.subtext)),
         status,
@@ -734,7 +736,7 @@ impl Drop for Restore {
 fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, / search, s sort, d details, T theme (saved), Ctrl+T query, q quit.\nIntegration: --view-state PATH restores session state.\nExit 2: unsupported input; caller should use a text pager."
+            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, f or / search, s sort, d details, T theme (saved), Ctrl+T query, q quit.\nIntegration: --view-state PATH restores session state.\nExit 2: unsupported input; caller should use a text pager."
         );
         return Ok(());
     }
@@ -846,6 +848,33 @@ mod tests {
         assert_eq!(a.row, 1);
         a.move_row(-100);
         assert_eq!(a.row, 0);
+    }
+    #[test]
+    fn f_and_slash_search_without_claiming_modified_f() {
+        for opener in ['/', 'f'] {
+            let mut a = app();
+            a.search = "old".into();
+            a.key(event::KeyEvent::new(
+                KeyCode::Char(opener),
+                KeyModifiers::NONE,
+            ));
+            assert!(a.editing);
+            assert!(a.search.is_empty());
+            a.key(event::KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+            assert_eq!(a.search, "f", "f stays literal inside search input");
+            a.key(event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            for c in "a|b".chars() {
+                a.key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            a.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(!a.editing);
+            assert_eq!((a.row, a.col), (1, 1));
+        }
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let mut a = app();
+            a.key(event::KeyEvent::new(KeyCode::Char('f'), modifier));
+            assert!(!a.editing);
+        }
     }
     #[test]
     fn vim_half_page_moves_grid_without_toggling_details() {
