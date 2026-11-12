@@ -62,7 +62,7 @@ def remember(directory, data):
     if directory is None:
         return
     # A new result invalidates the previous viewport, even for identical rows.
-    for name in ["view.json", "result"]:
+    for name in ["view.json", "result", "query.json"]:
         (directory / name).unlink(missing_ok=True)
     if len(data) > MAX_CACHE_BYTES:
         return

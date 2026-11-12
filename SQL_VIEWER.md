@@ -2,7 +2,8 @@
 
 `sql-viewer` is a separate pager binary in this repository. It reuses ddb-tui's
 Ratatui stack and themes; its table model is independent of DynamoDB.
-It never connects to a database. The mycli and pgcli forks need no source changes.
+It never connects to a database. The ggiho mycli and pgcli forks own the database
+connection and supply typed result batches over a private local socket.
 
 The macOS and Linux release archives include both `ddb-tui` and `sql-viewer`.
 With the ggiho dotfiles, `chezmoi init --apply ggiho` (new Mac) or `chezmoi update`
@@ -43,14 +44,14 @@ failure go to the existing less wrapper with the original bytes.
 | Key | Action |
 | --- | --- |
 | `hjkl`, arrows | Move selected cell; automatically scroll |
-| `g`, `G` | First / last row |
+| `g`, `G` | First / last loaded row |
 | Page Up / Down | Move one page |
 | `Ctrl+D`, `Ctrl+U` | Move grid down / up half a visible page (Vim style) |
 | `v` | Copy displayed cell using `pbcopy` |
 | `y` | Copy displayed row as TSV |
-| `f` or `/`, Enter | Search all cells, case insensitive |
+| `f` or `/`, Enter | Search loaded cells, case insensitive |
 | `n`, `N` | Next / previous match |
-| `s` | Sort selected column, toggle ascending / descending |
+| `s` | Sort loaded rows by selected column, toggle ascending / descending |
 | `d` | Toggle record details; hide to give the grid the full width |
 | `[`, `]` | Scroll right-hand record details |
 | `T` | Cycle theme and save the selection |
@@ -67,9 +68,10 @@ Restart the CLI after updating, then run a query to populate its session cache.
 
 The cache is private to each CLI process (including concurrent connections),
 stored in its mode-0700 temporary directory, and removed on normal process exit.
-Results above 64 MiB are not cached; an oversized result clears the old cache
-instead of reopening stale data. The cache integration requires this custom pager and a compatible viewer. Restart the
-CLI after updating the forks. Existing mycli `\last` remains available separately.
+The typed preview keeps at most 64 MiB of estimated display data or 100,000 rows;
+reaching that limit closes the cursor and clearly marks the unreceived tail. The
+legacy text cache rejects results above 64 MiB. Restart both CLIs after updating
+the forks. Existing mycli `\last` refers to the loaded preview for a paged query.
 
 The default `terminal` theme uses the terminal's background, foreground, and ANSI
 palette. In your WezTerm this follows the custom Catppuccin Mocha colors, including
@@ -104,15 +106,49 @@ inspector when the pointer is over it; otherwise it moves grid rows. Terminals n
 columns hide the details pane. Quitting restores the previous terminal screen;
 the grid is not reprinted into scrollback.
 
-The input contract is **ascii_escaped display text**, not raw database records.
-Do not switch the CLI to an unescaped format while using this pager: rendered
-multiline values cannot reliably be distinguished from extra rows. `--escaped`
-is required for direct invocation, e.g. `sql-viewer --escaped < result.txt`.
-Line breaks retain their visible escapes, alignment whitespace is trimmed, and
-NULL remains the CLI's display marker. Copying therefore does not promise an
-exact round trip of original database values. Plain decimals sort exactly,
-including large integer IDs; other columns (including scientific notation,
-NULL markers, and mixed values) sort as text. All rows are held in memory.
+With compatible ggiho forks, ordinary single-table SELECTs use the existing
+connection's streaming cursor. The first batch contains at most 500 rows, with one
+lookahead row to detect more data; moving past the last loaded row requests the
+next batch. Batches have a soft 4 MiB budget (one large row may exceed it). There is
+no automatic LIMIT/OFFSET rewrite, COUNT query, or query rerun. Explicit LIMITs
+remain unchanged. This reduces client buffering; database sorting and execution
+can still take time before the first row arrives.
+
+The footer distinguishes `DB batches` from results already buffered by the driver.
+`500+ loaded` means the total is unknown, not that the query returned 500 rows.
+Search text and current/total matching-cell counts stay visible independently of
+copy feedback. Sorting is shown both in the column header (↑/↓) and footer. Search
+and sorting cover loaded rows only; newly fetched rows join the active sort.
+Actual SQL NULL flags travel separately from text: NULL stays last in either sort
+direction, numeric values such as 2 and 10 sort numerically even with NULL, and the
+literal string `NULL` remains ordinary text.
+
+Ctrl+T retains the live cursor and loaded rows. Running another command closes the
+old cursor before reusing its connection; its loaded rows can still be reopened,
+with a notice that more rows are unavailable. MySQL cancels only its own active
+query using a short-lived control connection, then drains/closes the cursor;
+PostgreSQL cancels/drains its stream. The main connection is preserved. The pager
+stays responsive while a batch is being fetched, including when closing it.
+
+Streaming is deliberately conservative: a single SELECT from a verified permanent
+base table, autocommit on, and no active transaction. Joins, functions, CTEs,
+subqueries, locks, SELECT INTO, views, temporary tables and other complex queries
+keep the existing buffered execution path. PostgreSQL RLS/rules also use that
+path. Those SELECTs can still use typed preview/NULL flags, but the driver has
+already received all rows. Writes, multi-statements, source/watch commands,
+expanded output, export/redirection, tee/logging and other pagers keep their
+existing behavior. Set `SQL_VIEWER_PAGING=0` before starting either CLI to use the
+legacy pager path. Older viewer binaries retain Ctrl+T without enabling batches.
+
+The legacy input contract remains **ascii_escaped display text**, not raw records.
+Do not switch to an unescaped format: multiline values cannot reliably be
+separated from rows. Direct invocation requires `--escaped`, e.g.
+`sql-viewer --escaped < result.txt`. Alignment whitespace is trimmed, visible
+escapes and the CLI NULL marker remain text. Legacy input cannot distinguish a
+literal NULL marker from SQL NULL, so mixed columns keep text sorting. Typed input
+preserves surrounding spaces and escapes terminal control characters. Copying
+uses complete displayed values, not visual truncation; it does not promise an
+exact round trip of original database types.
 
 The ggiho mycli fork can arrange a single column as an `ls`-style grid. One-column
 rows containing two consecutive spaces fall back to less conservatively, because

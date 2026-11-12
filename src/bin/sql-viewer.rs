@@ -1,6 +1,7 @@
 //! Interactive pager for already formatted SQL results; never connects to a database.
 use anyhow::Result;
 use ddb_tui::{
+    sql_query::{Batch, QueryClient},
     sql_table::{self, SqlTable},
     theme, ui,
 };
@@ -86,6 +87,19 @@ fn save_theme(path: Option<&std::path::Path>, name: &str) -> io::Result<()> {
 
 struct App {
     data: SqlTable,
+    nulls: Vec<Vec<bool>>,
+    row_ids: Vec<usize>,
+    query: Option<QueryClient>,
+    has_more: bool,
+    can_fetch: bool,
+    fetch_mode: String,
+    loading: bool,
+    incoming: Option<std::sync::mpsc::Receiver<std::result::Result<Batch, String>>>,
+    pending_row: Option<usize>,
+    generation: usize,
+    matches_generation: usize,
+    matches_search: String,
+    matches: Vec<(usize, usize)>,
     selected_theme: usize,
     row: usize,
     col: usize,
@@ -124,7 +138,22 @@ impl App {
                     + 2
             })
             .collect();
+        let nulls = vec![vec![false; data.headers.len()]; data.rows.len()];
+        let row_ids = (0..data.rows.len()).collect();
         Self {
+            nulls,
+            row_ids,
+            query: None,
+            has_more: false,
+            can_fetch: false,
+            fetch_mode: "cached".into(),
+            loading: false,
+            incoming: None,
+            pending_row: None,
+            generation: 0,
+            matches_generation: usize::MAX,
+            matches_search: String::new(),
+            matches: Vec::new(),
             widths,
             data,
             selected_theme: 0,
@@ -151,7 +180,7 @@ impl App {
     fn view_state(&self) -> serde_json::Value {
         serde_json::json!({"row":self.row,"col":self.col,"top":self.top,"left":self.left,
             "search":self.search,"sorted":self.sorted,"descending":self.descending,
-            "details_scroll":self.details_scroll,"show_details":self.show_details})
+            "details_scroll":self.details_scroll,"show_details":self.show_details,"order":self.row_ids,"selected_id":self.row_ids.get(self.row)})
     }
     fn restore_view(&mut self, state: &serde_json::Value) {
         let index = |name: &str| state[name].as_u64().and_then(|n| usize::try_from(n).ok());
@@ -161,9 +190,44 @@ impl App {
             self.descending = !state["descending"].as_bool().unwrap_or(false);
             self.sort();
         }
+        if let Some(order) = state["order"]
+            .as_array()
+            .filter(|a| a.len() == self.data.rows.len())
+        {
+            let ids: Option<Vec<usize>> = order
+                .iter()
+                .map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+                .collect();
+            if let Some(ids) = ids.filter(|ids| {
+                ids.iter().all(|&i| i < self.data.rows.len())
+                    && ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len()
+            }) {
+                let mut slots: Vec<_> = std::mem::take(&mut self.data.rows)
+                    .into_iter()
+                    .zip(std::mem::take(&mut self.nulls))
+                    .zip(std::mem::take(&mut self.row_ids))
+                    .map(|((row, nulls), id)| (id, (row, nulls)))
+                    .collect();
+                slots.sort_by_key(|(id, _)| *id);
+                let mut slots: Vec<_> = slots.into_iter().map(|(_, value)| Some(value)).collect();
+                for &id in &ids {
+                    let (row, nulls) = slots[id].take().expect("validated unique row identity");
+                    self.data.rows.push(row);
+                    self.nulls.push(nulls);
+                }
+                self.row_ids = ids;
+                self.generation += 1;
+            }
+        }
         self.row = index("row")
             .unwrap_or(0)
             .min(self.data.rows.len().saturating_sub(1));
+        if let Some(id) = index("selected_id")
+            && let Some(row) = self.row_ids.iter().position(|&v| v == id)
+        {
+            self.row = row;
+        }
+
         self.col = index("col")
             .unwrap_or(0)
             .min(self.data.headers.len().saturating_sub(1));
@@ -215,6 +279,7 @@ impl App {
             let row = self.top + (y - self.grid.y) as usize;
             if row < self.data.rows.len() {
                 self.col = *col;
+                self.pending_row = None;
                 if self.row != row {
                     self.details_scroll = 0;
                 }
@@ -249,65 +314,193 @@ impl App {
         }
     }
     fn move_row(&mut self, delta: isize) {
-        self.row = self
-            .row
-            .saturating_add_signed(delta)
-            .min(self.data.rows.len().saturating_sub(1));
+        if delta < 0 {
+            self.pending_row = None;
+        }
+        let target = self.row.saturating_add_signed(delta);
+        if delta > 0 && target >= self.data.rows.len() && self.has_more && self.can_fetch {
+            self.pending_row = Some(target);
+            self.request_more();
+        }
+        self.row = target.min(self.data.rows.len().saturating_sub(1));
         self.details_scroll = 0;
     }
-    fn find(&mut self, backwards: bool) {
-        let columns = self.data.headers.len();
-        let count = self.data.rows.len() * columns;
-        if count == 0 || self.search.is_empty() {
+    fn ensure_metadata(&mut self) {
+        if self.nulls.len() != self.data.rows.len() {
+            self.nulls = vec![vec![false; self.data.headers.len()]; self.data.rows.len()];
+            self.row_ids = (0..self.data.rows.len()).collect();
+            self.generation += 1;
+        }
+    }
+    fn update_matches(&mut self) {
+        if self.matches_generation == self.generation && self.matches_search == self.search {
             return;
         }
-        let start = self.row * columns + self.col;
-        let query = self.search.to_lowercase();
-        for step in 1..=count {
-            let i = if backwards {
-                (start + count - step) % count
-            } else {
-                (start + step) % count
-            };
-            if self.data.rows[i / columns][i % columns]
-                .to_lowercase()
-                .contains(&query)
-            {
-                self.row = i / columns;
-                self.col = i % columns;
-                self.details_scroll = 0;
-                self.notice.clear();
-                return;
+        self.matches.clear();
+        if !self.search.is_empty() {
+            let query = self.search.to_lowercase();
+            for (r, row) in self.data.rows.iter().enumerate() {
+                for (c, value) in row.iter().enumerate() {
+                    if value.to_lowercase().contains(&query) {
+                        self.matches.push((r, c));
+                    }
+                }
             }
         }
-        self.notice = "No match".into();
+        self.matches_search = self.search.clone();
+        self.matches_generation = self.generation;
     }
-    fn sort(&mut self) {
-        self.descending = self.sorted == Some(self.col) && !self.descending;
-        self.sorted = Some(self.col);
-        let col = self.col;
-        let numeric = self.data.rows.iter().all(|r| decimal(&r[col]).is_some());
-        self.data.rows.sort_by(|a, b| {
-            let order = if numeric {
-                compare_decimal(&a[col], &b[col])
-            } else {
-                a[col].cmp(&b[col])
-            };
-            if self.descending {
-                order.reverse()
-            } else {
-                order
+    fn find(&mut self, backwards: bool) {
+        self.pending_row = None;
+        self.update_matches();
+        let current = (self.row, self.col);
+        let found = if backwards {
+            self.matches
+                .iter()
+                .rev()
+                .find(|&&p| p < current)
+                .or_else(|| self.matches.last())
+        } else {
+            self.matches
+                .iter()
+                .find(|&&p| p > current)
+                .or_else(|| self.matches.first())
+        };
+        if let Some(&(row, col)) = found {
+            self.row = row;
+            self.col = col;
+            self.details_scroll = 0;
+            self.notice.clear();
+        } else if !self.search.is_empty() {
+            self.notice = "No match in loaded rows".into();
+        }
+    }
+    fn sort_rows(&mut self) {
+        self.ensure_metadata();
+        let Some(col) = self.sorted else {
+            return;
+        };
+        let non_null: Vec<_> = self
+            .data
+            .rows
+            .iter()
+            .zip(&self.nulls)
+            .filter(|(_, n)| !n[col])
+            .map(|(r, _)| r[col].as_str())
+            .collect();
+        let numeric = !non_null.is_empty() && non_null.iter().all(|v| decimal(v).is_some());
+        let mut records: Vec<_> = std::mem::take(&mut self.data.rows)
+            .into_iter()
+            .zip(std::mem::take(&mut self.nulls))
+            .zip(std::mem::take(&mut self.row_ids))
+            .map(|((r, n), id)| (r, n, id))
+            .collect();
+        records.sort_by(|(a, an, _), (b, bn, _)| match (an[col], bn[col]) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (true, true) => std::cmp::Ordering::Equal,
+            _ => {
+                let order = if numeric {
+                    compare_decimal(&a[col], &b[col])
+                } else {
+                    a[col].cmp(&b[col])
+                };
+                if self.descending {
+                    order.reverse()
+                } else {
+                    order
+                }
             }
         });
+        for (r, n, id) in records {
+            self.data.rows.push(r);
+            self.nulls.push(n);
+            self.row_ids.push(id);
+        }
+        self.generation += 1;
+    }
+    fn sort(&mut self) {
+        self.pending_row = None;
+        self.descending = self.sorted == Some(self.col) && !self.descending;
+        self.sorted = Some(self.col);
+        self.sort_rows();
         self.row = 0;
         self.top = 0;
         self.details_scroll = 0;
-        self.notice = format!(
-            "Sorted {} {} ({})",
-            self.data.headers[col],
-            if self.descending { "↓" } else { "↑" },
-            if numeric { "decimal" } else { "text" }
-        );
+        self.notice = "Sorted loaded rows; NULLs last".into();
+    }
+    fn request_more(&mut self) {
+        if self.loading || !self.has_more || !self.can_fetch {
+            return;
+        }
+        let Some(client) = self.query.clone() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.loading = true;
+        self.incoming = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(client.request("next").map_err(|e| e.to_string()));
+        });
+    }
+    fn receive_batch(&mut self) -> bool {
+        let Some(rx) = self.incoming.as_ref() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(v) => v,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(_) => Err("Result worker closed".into()),
+        };
+        self.loading = false;
+        self.incoming = None;
+        match result {
+            Ok(batch) => {
+                if batch.base != self.data.rows.len() || batch.headers != self.data.headers {
+                    self.can_fetch = false;
+                    self.notice = "Result batch does not match cached query".into();
+                    return true;
+                }
+                for (c, width) in self.widths.iter_mut().enumerate() {
+                    *width = (*width).max(
+                        batch
+                            .rows
+                            .iter()
+                            .map(|r| r[c].width().clamp(6, 36) as u16 + 2)
+                            .max()
+                            .unwrap_or(*width),
+                    );
+                }
+                let selected = self.row_ids.get(self.row).copied();
+                let old_count = self.data.rows.len();
+                self.row_ids.extend(old_count..old_count + batch.rows.len());
+                self.data.rows.extend(batch.rows);
+                self.nulls.extend(batch.nulls);
+                self.has_more = batch.has_more;
+                self.can_fetch = batch.can_fetch;
+                self.fetch_mode = batch.mode;
+                self.notice = batch.message;
+                self.generation += 1;
+                if self.sorted.is_some() {
+                    self.sort_rows();
+                    if let Some(id) = selected {
+                        self.row = self
+                            .row_ids
+                            .iter()
+                            .position(|v| *v == id)
+                            .unwrap_or(self.row);
+                    }
+                } else if let Some(row) = self.pending_row.take() {
+                    self.row = row.min(self.data.rows.len().saturating_sub(1));
+                }
+                self.pending_row = None;
+            }
+            Err(error) => {
+                self.can_fetch = false;
+                self.notice = format!("Fetch failed: {error}");
+            }
+        }
+        true
     }
     fn copy(&mut self, whole_row: bool) {
         let Some(row) = self.data.rows.get(self.row) else {
@@ -397,7 +590,10 @@ impl App {
                 self.col = (self.col + 1).min(self.data.headers.len() - 1);
             }
             KeyCode::Char('g') | KeyCode::Home => self.move_row(-(self.row as isize)),
-            KeyCode::Char('G') | KeyCode::End => self.move_row(self.data.rows.len() as isize),
+            KeyCode::Char('G') | KeyCode::End => {
+                self.row = self.data.rows.len().saturating_sub(1);
+                self.details_scroll = 0;
+            }
             KeyCode::PageDown => self.move_row(self.page as isize),
             KeyCode::PageUp => self.move_row(-(self.page as isize)),
             KeyCode::Char('/') | KeyCode::Char('f')
@@ -550,11 +746,15 @@ fn draw_details(f: &mut Frame, app: &mut App, area: Rect, t: &theme::Theme) {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    app.ensure_metadata();
+    if !app.editing {
+        app.update_matches();
+    }
     let t = app.colors();
     let [title, body, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(2),
+        Constraint::Length(3),
     ])
     .areas(f.area());
     f.render_widget(
@@ -572,7 +772,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         title,
     );
     if app.help {
-        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\nf or /  Search · Enter to find · n/N next/previous\ns  Sort selected column, toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nCtrl+T  Return to query input\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
+        f.render_widget(Paragraph::new("hjkl / arrows  Move cell\ng / G  First / last loaded row\nPgUp / PgDn  Page\nCtrl+D / Ctrl+U  Half page down / up\nv  Copy displayed cell\ny  Copy displayed row as TSV\nf or /  Search · Enter to find · n/N next/previous\ns  Sort loaded rows; NULLs last; toggle direction\n[ / ]  Scroll record details\nd  Show / hide record details\nAt loaded end, moving down fetches the next batch\nMouse  Select cell/field; wheel scrolls the hovered pane\nT  Change theme (saved for next result)\nCtrl+T  Return to query input\nq / Esc  Close\n\nValues are formatted display text. Padding is removed.\nInput must use ascii_escaped; copied values retain visible escapes.").wrap(Wrap{trim:false}).block(Block::bordered().title(" Keys ")),body);
         return;
     }
     let (grid, details) = if app.show_details && body.width >= 80 {
@@ -651,7 +851,19 @@ fn draw(f: &mut Frame, app: &mut App) {
             };
             draw_cell(
                 f,
-                &app.data.headers[c],
+                &if app.sorted == Some(c) {
+                    format!(
+                        "{} {}",
+                        ui::fit(
+                            &app.data.headers[c],
+                            false,
+                            width.saturating_sub(4) as usize
+                        ),
+                        if app.descending { "↓" } else { "↑" }
+                    )
+                } else {
+                    app.data.headers[c].clone()
+                },
                 Rect::new(x, inside.y, width, 1),
                 style,
             );
@@ -701,30 +913,80 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some(area) = details {
         draw_details(f, app, area, &t);
     }
-    let message = if app.editing {
-        format!("/{}▏", app.search)
-    } else if !app.notice.is_empty() {
-        app.notice.clone()
+    let mode = match app.fetch_mode.as_str() {
+        "streamed" => "DB batches",
+        "buffered" => "all rows received",
+        _ => "cached text",
+    };
+    let position = format!(
+        "row {}/{}{} · column {}/{} · {mode}",
+        if app.data.rows.is_empty() {
+            0
+        } else {
+            app.row + 1
+        },
+        app.data.rows.len(),
+        if app.has_more { "+ loaded" } else { " loaded" },
+        app.col + 1,
+        app.data.headers.len()
+    );
+    let loading = if app.loading {
+        " · fetching…"
+    } else if app.has_more && app.can_fetch {
+        " · more available"
+    } else if app.has_more {
+        " · cursor closed"
     } else {
-        format!(
-            "row {}/{} · column {}/{}",
-            if app.data.rows.is_empty() {
-                0
-            } else {
-                app.row + 1
-            },
-            app.data.rows.len(),
-            app.col + 1,
-            app.data.headers.len()
+        " · end"
+    };
+    let [position_area, mode_area, key_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(status);
+    let [search_area, sort_area] =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .areas(mode_area);
+    let search = if app.editing {
+        ui::fit(
+            &format!("Search: /{}", app.search),
+            true,
+            search_area.width as usize,
         )
+    } else if app.search.is_empty() {
+        "Search: —".into()
+    } else {
+        let rank = app
+            .matches
+            .iter()
+            .position(|&p| p == (app.row, app.col))
+            .map(|n| (n + 1).to_string())
+            .unwrap_or("—".into());
+        let suffix = format!(" · {}/{} (loaded)", rank, app.matches.len());
+        let room = (search_area.width as usize).saturating_sub(8 + suffix.width());
+        format!("Search: {}{suffix}", ui::fit(&app.search, false, room))
+    };
+    let sort = if let Some(c) = app.sorted {
+        let suffix = format!(" {} (loaded)", if app.descending { "↓" } else { "↑" });
+        let room = (sort_area.width as usize).saturating_sub(6 + suffix.width());
+        format!(
+            "Sort: {}{suffix}",
+            ui::fit(&app.data.headers[c], false, room)
+        )
+    } else {
+        "Sort: original".into()
     };
     f.render_widget(
-        Paragraph::new(format!(
-            " {message}\n hjkl move  v cell  y row  f,/ search  s sort  d details  T theme  ^T query  q quit"
-        ))
-        .style(theme::fg(t.subtext)),
-        status,
+        Paragraph::new(format!(" {position}{loading}  {}", app.notice)).style(theme::fg(t.subtext)),
+        position_area,
     );
+    f.render_widget(
+        Paragraph::new(search).style(theme::fg(t.subtext)),
+        search_area,
+    );
+    f.render_widget(Paragraph::new(sort).style(theme::fg(t.subtext)), sort_area);
+    f.render_widget(Paragraph::new(" hjkl move  v cell  y row  f,/ search  s sort  d details  T theme  ^T query  ? help  q quit").style(theme::fg(t.subtext)),key_area);
 }
 struct Restore;
 impl Drop for Restore {
@@ -736,13 +998,20 @@ impl Drop for Restore {
 fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, f or / search, s sort, d details, T theme (saved), Ctrl+T query, q quit.\nIntegration: --view-state PATH restores session state.\nExit 2: unsupported input; caller should use a text pager."
+            "sql-viewer: read cli_helpers ascii_escaped output on stdin (--escaped required).\nKeys: hjkl, Ctrl+D/U half page, v cell copy, y row copy, f or / search, s sort, d details, T theme (saved), Ctrl+T query, q quit.\nIntegration: --view-state PATH restores session state; --query-socket PATH reads typed batches.\nExit 2: unsupported input; caller should use a text pager."
         );
         return Ok(());
     }
     let mut args = std::env::args().skip(1);
     let mut view_path = None;
+    let mut query_path = None;
     while let Some(arg) = args.next() {
+        if arg == "--query-socket" {
+            query_path =
+                Some(std::path::PathBuf::from(args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--query-socket needs a path")
+                })?));
+        }
         if arg == "--view-state" {
             view_path =
                 Some(std::path::PathBuf::from(args.next().ok_or_else(|| {
@@ -750,22 +1019,49 @@ fn main() -> Result<()> {
                 })?));
         }
     }
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
-    if !io::stdout().is_terminal() || input.trim().is_empty() {
-        print!("{input}");
-        return Ok(());
-    }
-    if !std::env::args().any(|a| a == "--escaped") {
-        std::process::exit(2);
-    }
-    let Some(data) = sql_table::parse_escaped(&input) else {
-        std::process::exit(2);
+    let query = query_path
+        .as_ref()
+        .map(|p| QueryClient::connect(p))
+        .transpose()?;
+    let mut initial = None;
+    let data = if let Some(client) = &query {
+        let batch = client.request("init")?;
+        if batch.rows.is_empty() {
+            println!(
+                "{}",
+                if batch.message.is_empty() {
+                    "0 rows"
+                } else {
+                    &batch.message
+                }
+            );
+            return Ok(());
+        }
+        let data = SqlTable {
+            headers: batch.headers.clone(),
+            rows: batch.rows.clone(),
+        };
+        initial = Some(batch);
+        data
+    } else {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        if !io::stdout().is_terminal() || input.trim().is_empty() {
+            print!("{input}");
+            return Ok(());
+        }
+        if !std::env::args().any(|a| a == "--escaped") {
+            std::process::exit(2);
+        }
+        let Some(data) = sql_table::parse_escaped(&input) else {
+            std::process::exit(2);
+        };
+        if data.rows.is_empty() {
+            print!("{input}");
+            return Ok(());
+        }
+        data
     };
-    if data.rows.is_empty() {
-        print!("{input}");
-        return Ok(());
-    }
     // On macOS kqueue cannot watch a newly opened /dev/tty. Reuse the
     // already-open terminal descriptor after consuming the piped result.
     // This pager owns stdin and has no background readers at this point.
@@ -780,6 +1076,14 @@ fn main() -> Result<()> {
         }
     }
     let mut app = App::new(data);
+    app.query = query;
+    if let Some(batch) = initial {
+        app.nulls = batch.nulls;
+        app.has_more = batch.has_more;
+        app.can_fetch = batch.can_fetch;
+        app.fetch_mode = batch.mode;
+        app.notice = batch.message;
+    }
     app.apply_theme(load_theme(theme_path().as_deref()));
     if let Some(state) = view_path
         .as_ref()
@@ -797,8 +1101,20 @@ fn main() -> Result<()> {
         previous(info);
     }));
     execute!(io::stdout(), EnableMouseCapture)?;
+    let mut dirty = true;
     loop {
-        terminal.draw(|f| draw(f, &mut app))?;
+        if dirty {
+            terminal.draw(|f| draw(f, &mut app))?;
+            dirty = false;
+        }
+        if app.receive_batch() {
+            dirty = true;
+            continue;
+        }
+        if !event::poll(std::time::Duration::from_millis(50))? {
+            continue;
+        }
+        dirty = true;
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if app.key(key) {
@@ -941,6 +1257,121 @@ mod tests {
         assert!(reopened.key(ctrl_t));
     }
     #[test]
+    fn typed_nulls_sort_last_in_both_directions_without_guessing_strings() {
+        let mut a = App::new(SqlTable {
+            headers: vec!["amount".into()],
+            rows: vec![
+                vec!["10".into()],
+                vec!["NULL".into()],
+                vec!["2".into()],
+                vec![String::new()],
+            ],
+        });
+        a.nulls = vec![vec![false], vec![true], vec![false], vec![true]];
+        a.sort();
+        assert_eq!(
+            a.data
+                .rows
+                .iter()
+                .map(|r| r[0].as_str())
+                .collect::<Vec<_>>(),
+            ["2", "10", "NULL", ""]
+        );
+        a.sort();
+        assert_eq!(
+            a.data
+                .rows
+                .iter()
+                .map(|r| r[0].as_str())
+                .collect::<Vec<_>>(),
+            ["10", "2", "NULL", ""]
+        );
+        let mut text = App::new(SqlTable {
+            headers: vec!["label".into()],
+            rows: vec![vec!["Z".into()], vec!["NULL".into()], vec![String::new()]],
+        });
+        text.nulls = vec![vec![false], vec![false], vec![true]];
+        text.sort();
+        assert_eq!(text.data.rows[0][0], "NULL");
+        assert!(!text.nulls[0][0]);
+        assert!(text.nulls[2][0]);
+    }
+    #[test]
+    fn search_and_sort_status_survive_copy_notice_and_column_movement() {
+        let mut a = app();
+        a.col = 0;
+        a.sort();
+        a.search = "a".into();
+        a.find(false);
+        a.notice = "Cell copied".into();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut a)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Search: a · 1/1"), "{text}");
+        assert!(text.contains("Sort: id ↑"), "{text}");
+        assert!(text.contains("Cell copied"));
+        assert!(
+            (a.grid.x..a.grid.x + a.widths[0]).any(|x| buffer[(x, a.grid.y - 2)].symbol() == "↑")
+        );
+    }
+    #[test]
+    fn appending_a_batch_keeps_selected_record_and_restores_duplicate_sort_order() {
+        let raw = vec![
+            vec!["0".into(), "10".into()],
+            vec!["1".into(), "2".into()],
+            vec!["2".into(), "NULL".into()],
+        ];
+        let mut a = App::new(SqlTable {
+            headers: vec!["id".into(), "amount".into()],
+            rows: raw.clone(),
+        });
+        a.nulls = vec![vec![false, false], vec![false, false], vec![false, true]];
+        a.col = 1;
+        a.sort();
+        a.row = 1;
+        assert_eq!(a.row_ids[a.row], 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.incoming = Some(rx);
+        a.loading = true;
+        tx.send(Ok(Batch {
+            headers: a.data.headers.clone(),
+            rows: vec![vec!["3".into(), "1".into()]],
+            nulls: vec![vec![false, false]],
+            base: 3,
+            has_more: false,
+            can_fetch: false,
+            message: String::new(),
+            mode: "streamed".into(),
+        }))
+        .unwrap();
+        assert!(a.receive_batch());
+        assert_eq!(a.row_ids[a.row], 0);
+        assert!(a.nulls.last().unwrap()[1]);
+        let state = a.view_state();
+        let mut all = raw;
+        all.push(vec!["3".into(), "1".into()]);
+        let mut reopened = App::new(SqlTable {
+            headers: a.data.headers.clone(),
+            rows: all,
+        });
+        reopened.nulls = vec![
+            vec![false, false],
+            vec![false, false],
+            vec![false, true],
+            vec![false, false],
+        ];
+        reopened.restore_view(&state);
+        assert_eq!(reopened.data.rows, a.data.rows);
+        assert_eq!(reopened.row_ids, a.row_ids);
+        assert_eq!(reopened.row_ids[reopened.row], 0);
+    }
+    #[test]
     fn decimal_sort_is_exact() {
         use std::cmp::Ordering::*;
         assert_eq!(
@@ -1001,7 +1432,7 @@ mod tests {
         assert_eq!(buffer[(divider, a.grid.y)].symbol(), "│");
         assert_eq!(a.data.rows[0][0], value);
         a.col = 1;
-        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 8)).unwrap();
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 9)).unwrap();
         narrow.draw(|f| draw(f, &mut a)).unwrap();
         assert!(a.hits.iter().any(|(_, col)| *col == 1));
         assert_eq!(a.page, a.grid.height as usize);
@@ -1014,7 +1445,7 @@ mod tests {
             .collect();
         a.row = 4;
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
         terminal.draw(|f| draw(f, &mut a)).unwrap();
         let colors = a.colors();
         let y = a.grid.y;

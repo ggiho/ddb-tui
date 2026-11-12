@@ -16,3 +16,5 @@ pub mod theme;
 pub mod ui;
 
 pub mod sql_table;
+
+pub mod sql_query;

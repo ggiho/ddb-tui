@@ -74,9 +74,11 @@ class PagerTests(unittest.TestCase):
                 self.assertEqual(pager.session_directory(), directory)
             pager.remember(directory, b'first result')
             (directory / 'view.json').write_text('{"row":3}')
+            (directory / 'query.json').write_text('{"protocol":1}')
             pager.remember(directory, b'next result')
             self.assertEqual((directory / 'result').read_bytes(), b'next result')
             self.assertFalse((directory / 'view.json').exists())
+            self.assertFalse((directory / 'query.json').exists())
             with patch.object(pager, 'MAX_CACHE_BYTES', 1):
                 pager.remember(directory, b'too large')
             self.assertFalse((directory / 'result').exists())

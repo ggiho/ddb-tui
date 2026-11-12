@@ -2,7 +2,7 @@
 
 ## Source of truth
 - Status: Active for the SQL viewer; existing DynamoDB screens retain their design.
-- Last refreshed: 2026-11-11.
+- Last refreshed: 2026-11-12.
 - Primary product surfaces: SQL grid and record inspector in `src/bin/sql-viewer.rs`.
 - Evidence reviewed: `SQL_VIEWER.md`, `src/theme.rs`, `src/ui/mod.rs`, viewer code and PTY tests; user feedback in this session. No reference images or earlier design brief found.
 
@@ -53,10 +53,10 @@
 - Clamp scrolling after resize; preserve scroll on column changes and reset on row changes; empty/tiny panels must not panic.
 
 ## Interaction states
-- Loading: none, data is already buffered.
+- Loading: show loaded-row count, unknown total (+), source mode and fetch availability; allow navigation/exit while a background socket request waits.
 - Empty: zero rows stay inline; empty cell is labeled `(empty)` only in inspector.
 - Error: all JSON remains original display text; pager fallback remains unchanged.
-- Success: existing copy feedback. Disabled/offline: no network operations.
+- Success: copy feedback never replaces search/count or sort state. Database access remains owned by the CLI; the viewer uses only its private local socket.
 
 ## Content voice
 - Short English labels consistent with existing UI: Record; keep metadata minimal.
@@ -69,4 +69,6 @@
 - Test wrapping, selection changes, bounded scrolling, mouse selection, narrow layouts, and copy fidelity; inspect a synthetic result in tmux.
 
 ## Open questions
-- None blocking this iteration. Exact original database types require a structured CLI-to-viewer protocol and remain out of scope.
+- None blocking this iteration. The typed protocol carries display strings and real NULL flags; it does not expose database types or enable editing.
+- Search/sort cover loaded rows, clearly labeled. Keep NULL last in both directions and preserve selected record identity when batches join an active sort.
+- Ctrl+T preserves the cursor until a new command; cursor ownership and cancellation belong to the CLI. No additional shortcuts.

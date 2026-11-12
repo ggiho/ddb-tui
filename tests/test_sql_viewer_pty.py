@@ -12,7 +12,7 @@ import termios
 import time
 import unittest
 
-BINARY = Path(__file__).resolve().parents[1] / 'target/debug/sql-viewer'
+BINARY = Path(os.environ.get('SQL_VIEWER_BIN', Path(__file__).resolve().parents[1] / 'target/debug/sql-viewer')).resolve()
 LONG_VALUE = 'beta-' + 'x' * 80
 RULE = '+----+' + '-' * (len(LONG_VALUE) + 2) + '+'
 DATA = ('\n'.join([RULE, '| id | ' + 'value'.ljust(len(LONG_VALUE)) + ' |', RULE,
