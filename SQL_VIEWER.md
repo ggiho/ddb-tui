@@ -13,10 +13,13 @@ Build and install from source on macOS:
 
 
 ```sh
-cargo build --bin sql-viewer
-install -m 755 target/debug/sql-viewer ~/.local/bin/sql-viewer
+cargo build --release --locked --bin sql-viewer
+install -m 755 target/release/sql-viewer ~/.local/bin/sql-viewer
 install -m 755 scripts/sql-pager ~/.local/libexec/sql-pager/viewer
 ```
+
+Install the optimized release binary, including for local UI/key-binding trials.
+Debug builds make long-value parsing and wrapping noticeably slower.
 
 In both `~/.myclirc` and `~/.config/pgcli/config`, set:
 
@@ -52,12 +55,15 @@ failure go to the existing less wrapper with the original bytes.
 | `[`, `]` | Scroll right-hand record details |
 | `T` | Cycle theme and save the selection |
 | `?` | Help |
+| `Ctrl+T` | Switch between query input and cached results (user-selected) |
 | `q`, Escape | Close help or exit |
 
-No result-toggle shortcut is assigned. Select a key with the user before adding
-any CLI, viewer, terminal or multiplexer binding. `q` / Escape return to the CLI.
-The session cache and viewer-state support remain available for a future explicit
-binding; cached results can be reopened without SQL execution.
+The user-selected **Ctrl+T** switches between query input and the last displayed
+result. It replaces the query prompt's character-transposition command. Drafts
+and cursor position remain intact; viewer selection, search, sorting and scroll
+state are restored without executing SQL. Small results can also be reopened.
+Alt+E and Alt+T remain unchanged. No terminal-global mapping is installed.
+Restart the CLI after updating, then run a query to populate its session cache.
 
 The cache is private to each CLI process (including concurrent connections),
 stored in its mode-0700 temporary directory, and removed on normal process exit.

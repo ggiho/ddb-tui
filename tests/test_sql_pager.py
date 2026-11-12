@@ -26,6 +26,21 @@ class PagerTests(unittest.TestCase):
         self.assertFalse(pager.fits(b"abcd\n", 3, 2))
         self.assertFalse(pager.fits(b"a\nb\n", 3, 2))
 
+    def test_fit_check_stops_after_the_screen_edge(self):
+        # A wide result needs the viewer as soon as it exceeds the viewport.
+        # Do not walk a megabyte-long field merely to decide that it is wide.
+        original = pager.unicodedata.east_asian_width
+        calls = 0
+        def bounded_width(char):
+            nonlocal calls
+            calls += 1
+            self.assertLessEqual(calls, 81, 'scanned beyond the viewport')
+            return original(char)
+        with patch.object(pager.unicodedata, 'east_asian_width', side_effect=bounded_width):
+            self.assertFalse(pager.fits(b'x' * 1_000_000, 80, 24))
+        self.assertTrue(pager.fits('서울e\u0301'.encode(), 5, 24))
+        self.assertFalse(pager.fits('서울e\u0301'.encode(), 4, 24))
+
     def test_redirect_preserves_exact_bytes(self):
         data = b"\x1b[31mraw\xff\n\n"
         result = subprocess.run(["python3", str(SCRIPT)], input=data, capture_output=True)

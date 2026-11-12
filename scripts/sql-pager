@@ -13,19 +13,21 @@ from pathlib import Path
 SGR = re.compile(r"\x1b\[[0-9;:]*m")
 
 
-def width(text):
+def width(text, limit=None):
     column = 0
     for char in SGR.sub("", text):
         if char == "\t":
             column += 8 - column % 8
         elif not unicodedata.combining(char) and not unicodedata.category(char).startswith("C"):
             column += 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if limit is not None and column > limit:
+            return column
     return column
 
 
 def fits(data, columns, rows):
     lines = data.decode("utf-8", "replace").splitlines()
-    return len(lines) < rows and all(width(line) <= columns for line in lines)
+    return len(lines) < rows and all(width(line, limit=columns) <= columns for line in lines)
 
 
 def run(command, data):

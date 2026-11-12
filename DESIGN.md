@@ -20,7 +20,7 @@
 - Jobs: scan results, read long values and JSON, copy a cell or row.
 
 ## Information architecture
-- Grid is primary; right-hand inspector follows its selection. No result-toggle shortcut is assigned until the user chooses one.
+- Grid is primary; right-hand inspector follows its selection. The user explicitly selected Ctrl+T for query/result switching on 2026-11-12. Alt+E and Alt+T remain unchanged.
 - Record-panel hierarchy: record position → every column name and full value in query order → persistent actions and scroll position.
 
 ## Design principles
@@ -64,6 +64,7 @@
 
 ## Implementation constraints
 - Rust/Ratatui, existing theme and serde_json only.
+- Install `cargo build --release --locked --bin sql-viewer` output for local trials and normal use; do not replace the installed pager with a debug binary.
 - Keep source values unchanged. Do not unescape arbitrary backslash sequences.
 - Test wrapping, selection changes, bounded scrolling, mouse selection, narrow layouts, and copy fidelity; inspect a synthetic result in tmux.
 
